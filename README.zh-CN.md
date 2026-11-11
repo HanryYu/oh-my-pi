@@ -27,7 +27,7 @@ rex-omp rollback
 
 运行目录不可变，旧会话仍保留自己的源码；回退选择之前已启用的版本。关闭或替换观察器不会取消 agent 或停止开发服务。官方 OMP 保留在原安装路径，可独立更新。
 
-完整代码位于 [`src/rex`](packages/coding-agent/src/rex)、[`rex-workspace`](packages/coding-agent/rex-workspace) 和 [`scripts/rex.py`](scripts/rex.py)。观察过程不发起模型请求。内建工具使用原生渲染，未知第三方工具使用通用渲染。
+完整代码位于 [`src/rex`](packages/coding-agent/src/rex)、[`rex-workspace`](packages/coding-agent/rex-workspace) 和 [`scripts/rex.py`](scripts/rex.py)。观察过程不发起模型请求；OMP 自身的正常推理和 recap 仍使用已配置的模型服务。内建工具使用原生渲染，未知第三方工具使用通用渲染。
 
 ---
 

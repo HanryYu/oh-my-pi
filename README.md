@@ -33,7 +33,7 @@ Focused checks cover 37 native bridge/readonly/eval cases, 52 Python workspace/u
 
 Observation added no provider calls and did not modify the child transcripts. External model inference was not exercised.
 
-The complete integration is in [`src/rex`](packages/coding-agent/src/rex), [`rex-workspace`](packages/coding-agent/rex-workspace) and [`scripts/rex.py`](scripts/rex.py). It makes no model requests for observation. Built-in tool content uses OMP's renderer; unknown third-party tools use the generic renderer.
+The complete integration is in [`src/rex`](packages/coding-agent/src/rex), [`rex-workspace`](packages/coding-agent/rex-workspace) and [`scripts/rex.py`](scripts/rex.py). It makes no model requests for observation. Normal OMP inference, including its own recaps, still uses the configured provider. Built-in tool content uses OMP's renderer; unknown third-party tools use the generic renderer.
 
 ---
 
