@@ -118,6 +118,7 @@ def validate_source(root, live=True):
         raise ValueError("invalid root identity")
     source = read_json(root / "root.json")
     pid = source.get("pid")
+    # Synced legacy extensions publish v2, but their OMP cannot run rex-view.
     if source.get("v") != 3 or type(pid) is not int or pid <= 0 or pid != int(match[2]):
         raise ValueError("not a native v3 source or invalid pid")
     for field in ("session", "anchor", "sessionId"):

@@ -27,6 +27,12 @@ Updates merge the fork's `rex` branch with an official stable release in a candi
 
 Runtimes are immutable. Existing OMP sessions retain their source files; rollback selects a previously activated runtime. Hiding or replacing the observer does not cancel agents or stop development servers. Official OMP remains available at its original installation path and can be updated separately.
 
+### Verification
+
+Focused checks cover 37 native bridge/readonly/eval cases, 52 Python workspace/update cases, Lua controller transitions and 16 panel behavior groups. An independent Rex server exercised the real native task/eval engine with a scripted local provider: direct and eval launch attribution, assistant content before JSONL persistence, actual `←←` Agent Hub content, detail reuse/removal, new-task isolation and a real HTTP listener.
+
+Observation added no provider calls and did not modify the child transcripts. External model inference was not exercised.
+
 The complete integration is in [`src/rex`](packages/coding-agent/src/rex), [`rex-workspace`](packages/coding-agent/rex-workspace) and [`scripts/rex.py`](scripts/rex.py). It makes no model requests for observation. Built-in tool content uses OMP's renderer; unknown third-party tools use the generic renderer.
 
 ---
