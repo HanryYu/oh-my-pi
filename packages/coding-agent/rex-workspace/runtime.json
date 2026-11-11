@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "initialBase": {
+    "tag": "v18.18.8",
+    "commit": "679691a78141de0dd6ba1b7a5d5c1b1d7d967a63"
+  },
+  "protocol": { "root": 3, "live": 1 },
+  "requiredFeatures": [
+    "packages/coding-agent/src/rex/bridge.ts",
+    "packages/coding-agent/src/rex/readonly/runtime.ts",
+    "packages/coding-agent/rex-workspace/lua/controller.lua",
+    "scripts/rex.py"
+  ],
+  "validationTests": [
+    "packages/coding-agent/test/rex/bridge.test.ts",
+    "packages/coding-agent/test/rex/journal.test.ts",
+    "packages/coding-agent/test/rex/security.test.ts",
+    "packages/coding-agent/test/rex/live.test.ts",
+    "packages/coding-agent/test/eval/agent-bridge.test.ts",
+    "packages/coding-agent/test/eval/eval-parent-tool-call-id.test.ts",
+    "packages/coding-agent/test/task/parked-subagent-prewalk-revive.test.ts"
+  ]
+}

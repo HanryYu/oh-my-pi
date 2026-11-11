@@ -1,3 +1,38 @@
+# OMP with Rex workspace support
+
+The `rex` branch of [HanryYu/oh-my-pi](https://github.com/HanryYu/oh-my-pi/tree/rex) adds a native Rex workspace to upstream OMP. Lua owns the layout and interaction. OMP publishes current-task events and renders the selected subagent in a read-only pane using its production transcript components.
+
+## Install this fork
+
+```sh
+git clone --branch rex https://github.com/HanryYu/oh-my-pi.git
+cd oh-my-pi
+python3 scripts/rex.py install
+rex-omp
+```
+
+Run `rex-omp` in Rex. Start a new session after installing; existing conversations are not restarted. The default right side is 25%, configurable with `REX_WORKSPACE_WIDTH=15..35`. Selecting a subagent opens one lower-right pane; switching agents reuses it. A new user task clears historical agents, and removing the selected agent closes its pane.
+
+The installer needs macOS, Python 3.9+, Git, Rex and `lsof`. It prepares a compatible private Bun and matching official native bindings. It does not replace Homebrew's `omp`, upgrade the global Bun, or change accounts, the composer, themes or global OMP settings. The fork skips the retired `rex-subagent-viewer` extension when loading extensions. Its files remain available to official OMP and configuration-sync peers.
+
+## Update and recovery
+
+```sh
+rex-omp fork-info
+rex-omp update
+rex-omp rollback
+```
+
+Updates merge the fork's `rex` branch with an official stable release in a candidate checkout. Frozen dependencies, matching native bindings, task-attribution/readonly regressions and CLI checks must pass before activation. Conflicts or failed checks leave the current runtime active and report an error. This is a maintained fork, not a guarantee that future upstream changes will merge without intervention.
+
+Runtimes are immutable. Existing OMP sessions retain their source files; rollback selects a previously activated runtime. Hiding or replacing the observer does not cancel agents or stop development servers. Official OMP remains available at its original installation path and can be updated separately.
+
+The complete integration is in [`src/rex`](packages/coding-agent/src/rex), [`rex-workspace`](packages/coding-agent/rex-workspace) and [`scripts/rex.py`](scripts/rex.py). It makes no model requests for observation. Built-in tool content uses OMP's renderer; unknown third-party tools use the generic renderer.
+
+---
+
+## Upstream OMP
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>

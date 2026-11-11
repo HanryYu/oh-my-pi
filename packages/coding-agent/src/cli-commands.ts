@@ -18,6 +18,7 @@ import {
 	VALUELESS_FLAGS,
 } from "./cli/flag-tables";
 import type * as LaunchHelp from "./commands/launch-help";
+import type * as RexView from "./commands/rex-view";
 
 function loadLaunchHelp(): typeof LaunchHelp.launchHelp {
 	const module: typeof LaunchHelp = require("./commands/launch-help");
@@ -252,6 +253,17 @@ export const commands: CommandEntry[] = [
 		name: "render",
 		load: () => import("./commands/render").then(m => m.default),
 		help: commandHelp.renderHelp,
+	},
+	{
+		name: "rex-view",
+		load: () => {
+			const module: typeof RexView = require("./commands/rex-view");
+			return Promise.resolve(module.default);
+		},
+		get help() {
+			const module: typeof RexView = require("./commands/rex-view");
+			return module.default;
+		},
 	},
 	{
 		name: "skill",

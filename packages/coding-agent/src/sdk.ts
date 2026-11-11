@@ -130,6 +130,7 @@ import {
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
+import { isRetiredRexExtension } from "./extensibility/extensions/loader";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { partitionStartupExtensions, recordStartupVerdicts } from "./extensibility/extensions/startup-deferral";
@@ -182,6 +183,7 @@ import {
 	type AgentRegistryApi,
 	MAIN_AGENT_ID,
 } from "./registry/agent-registry";
+import { mountRexBridge, REX_BRIDGE_SOURCE } from "./rex/mount";
 import {
 	buildSecretObfuscator,
 	deobfuscateSessionContext,
@@ -3020,7 +3022,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		} else if (restrictToolNames || options.preloadedPreparedExtensions) {
 			// Restricted children retain parent hooks, not ambient discovery, new
 			// extension inputs, or parent-bound instances. Tool admission stays clamped.
-			const preparedExtensions = options.preloadedPreparedExtensions ?? [];
+			const preparedExtensions = (options.preloadedPreparedExtensions ?? []).filter(
+				extension => extension.path !== REX_BRIDGE_SOURCE,
+			);
 			extensionPaths = preparedExtensions.map(prepared => prepared.path);
 			extensionsResult = await logger.time(
 				"bindPreparedExtensions",
@@ -3033,7 +3037,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				logger.error("Failed to bind extension", { path, error });
 			}
 		} else if (options.preloadedExtensionPaths) {
-			extensionPaths = options.preloadedExtensionPaths;
+			extensionPaths = options.preloadedExtensionPaths.filter(extensionPath => extensionPath !== REX_BRIDGE_SOURCE);
 			extensionsResult = await logger.time("loadExtensions", loadExtensions, extensionPaths, cwd, eventBus);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
@@ -3047,6 +3051,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				logger.error("Failed to load extension", { path, error });
 			}
 		}
+		// A native observer is session-local, not an externally discovered plugin.
+		// Never forward its bound closure or try importing its synthetic source path.
+		extensionsResult = await mountRexBridge(extensionsResult, cwd, agentDir, eventBus);
+		extensionPaths = extensionPaths.filter(
+			extensionPath => extensionPath !== REX_BRIDGE_SOURCE && !isRetiredRexExtension(extensionPath),
+		);
 		// Forward the source-path list (NOT the loaded instances) so subagents
 		// rebuild their own session-scoped extensions.
 		toolSession.extensionPaths = extensionPaths;

@@ -1,3 +1,38 @@
+# 支持 Rex 工作区的 OMP
+
+这是 [HanryYu/oh-my-pi 的 rex 分支](https://github.com/HanryYu/oh-my-pi/tree/rex)。Lua 管理布局和交互，OMP 原生发布当前任务事件，并用生产渲染组件显示只读子 agent 详情。
+
+## 安装此 fork
+
+```sh
+git clone --branch rex https://github.com/HanryYu/oh-my-pi.git
+cd oh-my-pi
+python3 scripts/rex.py install
+rex-omp
+```
+
+在 Rex 中新开 `rex-omp` 会话生效，不会重启现有对话。右侧默认占 25%，`REX_WORKSPACE_WIDTH` 可设为 15–35 的整数。点击子 agent 才打开唯一的右下详情，切换时复用；新用户任务清空历史列表，选中的 agent 被销毁后收起详情。
+
+安装需要 macOS、Python 3.9+、Git、Rex 和 `lsof`。安装器准备私有 Bun 与匹配的官方 native binding，不替换 Homebrew 的 `omp`、升级全局 Bun 或修改账号、输入框、主题及全局 OMP 设置。fork 加载扩展时会排除已退役的 `rex-subagent-viewer`，但保留其文件给官方版及配置同步的其他机器使用。
+
+## 更新与回退
+
+```sh
+rex-omp fork-info
+rex-omp update
+rex-omp rollback
+```
+
+更新在候选 checkout 中合并 fork 的 `rex` 分支与官方 stable release，冻结安装依赖并检查 native binding、任务归属、只读行为及 CLI 后才切换。冲突或验证失败会明确报错，当前可用版本保持不变；fork 并不保证未来所有上游变更都无需人工处理。
+
+运行目录不可变，旧会话仍保留自己的源码；回退选择之前已启用的版本。关闭或替换观察器不会取消 agent 或停止开发服务。官方 OMP 保留在原安装路径，可独立更新。
+
+完整代码位于 [`src/rex`](packages/coding-agent/src/rex)、[`rex-workspace`](packages/coding-agent/rex-workspace) 和 [`scripts/rex.py`](scripts/rex.py)。观察过程不发起模型请求。内建工具使用原生渲染，未知第三方工具使用通用渲染。
+
+---
+
+## 上游 OMP
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>

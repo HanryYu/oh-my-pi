@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Rex workspaces show current-task subagents, project changes and development servers beside the original conversation, with a proportional sidebar and one native read-only detail pane.
+- `rex-view` renders a selected subagent's original transcript and live in-flight content without creating a model session.
+- The fork's `rex-omp` installer supports validated official-release updates and rollback without replacing the official OMP installation.
+
+### Fixed
+
+- Subagents launched through eval retain their originating tool-call attribution.
+
 ## [18.18.8] - 2026-11-11
 
 ### Changed

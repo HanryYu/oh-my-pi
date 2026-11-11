@@ -65,6 +65,19 @@ installLegacyPiSpecifierShim();
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 type LoadedExtensionModule = ExtensionFactory | { default?: ExtensionFactory };
 
+let warnedRetiredRexExtension = false;
+
+/** The fork owns this integration; a synced vanilla extension must never run beside it. */
+export function isRetiredRexExtension(extensionPath: string): boolean {
+	if (!/(?:^|[/\\])rex-subagent-viewer(?:[/\\]|$)/.test(extensionPath)) return false;
+	if (!warnedRetiredRexExtension) {
+		warnedRetiredRexExtension = true;
+		logger.warn("Skipping retired rex-subagent-viewer extension; using the native Rex workspace", {
+			path: extensionPath,
+		});
+	}
+	return true;
+}
 /** RFC 3986 scheme syntax, lowercased, two characters at least so `c` cannot capture `C:/` paths. */
 const LINK_SCHEME_PATTERN = /^[a-z][a-z0-9+.-]+$/;
 
@@ -496,6 +509,9 @@ async function runExtensionFactory(
 /** Import one extension module and resolve its factory without binding it to a session. */
 export async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
+	if (isRetiredRexExtension(extensionPath) || isRetiredRexExtension(resolvedPath)) {
+		return { path: extensionPath, resolvedPath, factory: null, error: null };
+	}
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
@@ -523,6 +539,9 @@ async function bindExtension(
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
 ): Promise<{ extension: Extension | null; error: string | null }> {
+	if (isRetiredRexExtension(extensionPath) || isRetiredRexExtension(imported.resolvedPath)) {
+		return { extension: null, error: null };
+	}
 	const factory = imported.factory;
 	if (imported.error !== null || factory === null) {
 		return { extension: null, error: imported.error };
@@ -550,6 +569,7 @@ export async function loadExtensionFromFactory(
 	name = "<inline>",
 ): Promise<Extension> {
 	const extension = createExtension(name, name);
+	if (isRetiredRexExtension(name)) return extension;
 	const api = new ConcreteExtensionAPI(extension, runtime, cwd, eventBus);
 	await runExtensionFactory(factory, api, runtime);
 	return extension;
@@ -569,7 +589,9 @@ export async function loadExtensions(
 	eventBus?: EventBus,
 	runtime?: IExtensionRuntime,
 ): Promise<LoadExtensionsResult> {
-	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+	const preparedExtensions = await Promise.all(
+		paths.filter(extPath => !isRetiredRexExtension(extPath)).map(extPath => importExtensionModule(extPath, cwd)),
+	);
 	return bindPreparedExtensions(preparedExtensions, cwd, eventBus, runtime);
 }
 
@@ -587,8 +609,11 @@ export async function bindPreparedExtensions(
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
+	const activePrepared = preparedExtensions.filter(
+		prepared => !isRetiredRexExtension(prepared.path) && !isRetiredRexExtension(prepared.resolvedPath),
+	);
 
-	for (const prepared of preparedExtensions) {
+	for (const prepared of activePrepared) {
 		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
 
 		if (error) {
@@ -605,7 +630,7 @@ export async function bindPreparedExtensions(
 		extensions,
 		errors,
 		runtime,
-		preparedExtensions: [...preparedExtensions],
+		preparedExtensions: activePrepared,
 	};
 }
 

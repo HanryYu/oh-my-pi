@@ -17,6 +17,7 @@ try {
 import type * as WorkerThreads from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
 import type { CliConfig, CommandMetadata } from "@oh-my-pi/pi-utils/cli";
+import type * as Cli from "@oh-my-pi/pi-utils/cli";
 import type * as Postmortem from "@oh-my-pi/pi-utils/postmortem";
 import {
 	APP_NAME,
@@ -31,6 +32,7 @@ import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
 import { isNativeShell, runNativeShell } from "./cli/native-shell";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
+import type * as CliCommands from "./cli-commands";
 import {
 	AUTO_UPDATE_WORKER_ARG,
 	BLOB_BROKER_WORKER_ARG,
@@ -476,6 +478,19 @@ export async function runCli(argv: string[]): Promise<void> {
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);
 		resolvedArgv = extracted.argv;
+		// The detail host selects its source profile before loading presentation
+		// modules. It must bypass normal launch setup, config sync, the startup
+		// composer, network bootstrap and model/session construction entirely.
+		if (resolvedArgv[0] === "rex-view") {
+			if (extracted.profile !== undefined || extracted.aliasName !== undefined) {
+				throw new Error("rex-view uses the source workspace profile; --profile and --alias are not supported");
+			}
+			runningCommand = "rex-view";
+			const cli: typeof Cli = require("@oh-my-pi/pi-utils/cli.js");
+			const registry: typeof CliCommands = require("./cli-commands");
+			await cli.run({ bin: APP_NAME, version: VERSION, argv: resolvedArgv, commands: registry.commands });
+			return;
+		}
 		if (extracted.profile !== undefined) {
 			setProfile(extracted.profile);
 		} else {
