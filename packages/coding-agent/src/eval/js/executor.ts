@@ -16,6 +16,7 @@ import type { JsStatusEvent } from "./shared/types";
 import { cfgEvalAutoProvision } from "../settings";
 
 export interface JsExecutorOptions {
+	parentToolCallId?: string;
 	cwd?: string;
 	timeoutMs?: number;
 	deadlineMs?: number;
@@ -170,6 +171,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			filename: options.filename ?? `js-cell-${crypto.randomUUID()}.js`,
 			timeoutMs: runtimeTimeoutMs ?? options.idleTimeoutMs,
 			runState: {
+				parentToolCallId: options.parentToolCallId,
 				signal,
 				onReply: options.onReply,
 				onText: chunk => outputSink.push(chunk),

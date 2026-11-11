@@ -51,6 +51,7 @@ export default {
 		const kernelMode = cfgPythonKernelMode.get(opts.session);
 		const identity = resolvePythonKernelIdentity(opts.session);
 		const executorOptions: PythonExecutorOptions = {
+			parentToolCallId: opts.parentToolCallId,
 			cwd: identity.cwd,
 			filename: opts.filename,
 			idleTimeoutMs: opts.idleTimeoutMs,

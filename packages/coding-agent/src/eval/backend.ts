@@ -8,6 +8,7 @@ import type { EvalDisplayOutput } from "./types";
 
 /** Per-cell execute() options. */
 export interface ExecutorBackendExecOptions {
+	parentToolCallId?: string;
 	cwd: string;
 	sessionId: string;
 	sessionFile: string | undefined;

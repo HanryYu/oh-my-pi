@@ -50,6 +50,7 @@ const NO_REPLY_SINK =
 export type { JsStatusEvent } from "./shared/types";
 
 export interface ToolBridgeOptions {
+	parentToolCallId?: string;
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
@@ -292,7 +293,9 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		// messages; a bridged call would report success without taking effect.
 		throw new ToolError(`\`${name}\` cannot run through the eval bridge; call the direct \`${name}\` tool.`);
 	}
-	const toolCallId = `js-${name}-${crypto.randomUUID()}`;
+	const toolCallId = options.parentToolCallId
+		? `${options.parentToolCallId}:${crypto.randomUUID()}`
+		: `js-${name}-${crypto.randomUUID()}`;
 	// A schema-owned name stays tool data across alternatives. Deleting an
 	// invalid value to make another branch match could select a different operation.
 	// Harness `i` is dropped here exactly as `extractIntent` drops it on the direct

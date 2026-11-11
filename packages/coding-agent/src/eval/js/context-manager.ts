@@ -44,6 +44,8 @@ import type {
 export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
 
 export interface VmRunState {
+	/** Captured per run, including cells that outlive the user turn. */
+	parentToolCallId?: string;
 	signal?: AbortSignal;
 	onText?: (chunk: string) => void;
 	onDisplay?: (output: EvalDisplayOutput) => void;
@@ -835,6 +837,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 	pending.toolCalls.set(msg.id, ctrl);
 	try {
 		const value = await callSessionTool(msg.name, msg.args, {
+			parentToolCallId: pending.runState.parentToolCallId,
 			session: pending.toolSession,
 			signal: ctrl.signal,
 			identity: msg.identity,

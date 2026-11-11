@@ -71,6 +71,7 @@ export type KernelEnvPatch = Record<string, string | null | undefined>;
  * interfaces structurally extend this; the base executor only reads these.
  */
 export interface KernelExecutorBaseOptions {
+	parentToolCallId?: string;
 	cwd?: string;
 	filename?: string;
 	timeoutMs?: number;
@@ -535,6 +536,7 @@ export async function executeWithKernelBase<
 	const unregisterBridge =
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
+					parentToolCallId: options.parentToolCallId,
 					toolSession: options.toolSession,
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,

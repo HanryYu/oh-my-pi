@@ -198,4 +198,31 @@ describe("runEvalAgent", () => {
 
 		expect(recordEvalSubagentUsage).not.toHaveBeenCalled();
 	});
+	it("captures the outer eval call before a queued bare agent starts", async () => {
+		const agent: AgentDefinition = {
+			name: "task", description: "Task agent", systemPrompt: "Handle task", source: "bundled",
+		};
+		vi.spyOn(taskDiscovery, "discoverAgents").mockResolvedValue({ agents: [agent], projectAgentsDir: null });
+		const run = vi.spyOn(taskExecutor, "runSubprocess").mockResolvedValue(createResult());
+		const manager = new AsyncJobManager({});
+		jobManagers.add(manager);
+		const release = Promise.withResolvers<void>();
+		const register = manager.register.bind(manager);
+		vi.spyOn(manager, "register").mockImplementation((kind, label, execute, options) =>
+			register(kind, label, async context => { await release.promise; return execute(context); }, options),
+		);
+		const options: EvalAgentBridgeOptions = {
+			session: { ...createBudgetSession(SessionManager.inMemory()), asyncJobManager: manager },
+			parentToolCallId: "original-eval",
+		};
+		try {
+			await runEvalAgent({ prompt: "do work", agent: "task" }, options);
+			options.parentToolCallId = "later-eval";
+			release.resolve();
+			await manager.waitForAll();
+			expect(run).toHaveBeenCalledTimes(1);
+			expect(run.mock.calls[0]?.[0].parentToolCallId).toBe("original-eval");
+		} finally { release.resolve(); }
+	});
+
 });

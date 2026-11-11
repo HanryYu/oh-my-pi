@@ -60,6 +60,7 @@ export interface PythonToolInvokeOptions {
 }
 
 export interface PythonExecutorOptions {
+	parentToolCallId?: string;
 	/** Working directory for command execution */
 	cwd?: string;
 	/** Source filename for file-backed execution and tracebacks. */

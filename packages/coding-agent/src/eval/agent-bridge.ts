@@ -53,6 +53,7 @@ interface EvalAgentArgs {
 }
 
 export interface EvalAgentBridgeOptions {
+	parentToolCallId?: string;
 	session: ToolSession;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
@@ -216,6 +217,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		}
 		const id = await reserveStructuredSubagentId(options.session, { label: parsed.label });
 		const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
+		const parentToolCallId = options.parentToolCallId;
 		manager.register(
 			"task",
 			id,
@@ -224,6 +226,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 				let latestProgress: AgentProgress | undefined;
 				try {
 					const execution = await runStructuredSubagent({
+						parentToolCallId,
 						session: options.session,
 						invocationKind: "eval",
 						assignment: parsed.prompt,

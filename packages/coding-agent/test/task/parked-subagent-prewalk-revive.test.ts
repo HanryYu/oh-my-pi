@@ -17,6 +17,8 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir, setInteractiveHost } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { localSession } from "../helpers/local-session";
@@ -124,6 +126,11 @@ it("revives a parked subagent on its prewalk handoff target, keeping its todo li
 	);
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [planner, target, ...catalogAvailable(kind)]);
+	const eventBus = new EventBus();
+	const lifecycle: Array<{ parentToolCallId?: string; status?: string }> = [];
+	eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, frame => {
+		lifecycle.push(frame as { parentToolCallId?: string; status?: string });
+	});
 
 	try {
 		const result = await runSubprocess({
@@ -137,6 +144,8 @@ it("revives a parked subagent on its prewalk handoff target, keeping its todo li
 				source: "bundled",
 			},
 			task: "write out.txt",
+			parentToolCallId: "original-eval",
+			eventBus,
 			index: 0,
 			id: AGENT_ID,
 			modelOverride: `mock/${PLANNER}:medium`,
@@ -171,6 +180,10 @@ it("revives a parked subagent on its prewalk handoff target, keeping its todo li
 		expect(revived.configuredThinkingLevel()).toBe(Effort.High);
 		expect(revived.getPrewalkState()).toBeUndefined();
 		expect(revived.getActiveToolNames()).toContain("todo");
+		await revived.prompt("Report done again.");
+		expect(lifecycle.filter(frame => frame.status === "started").length).toBeGreaterThanOrEqual(2);
+		expect(lifecycle.length).toBeGreaterThan(0);
+		for (const frame of lifecycle) expect(frame.parentToolCallId).toBe("original-eval");
 	} finally {
 		authStorage.close();
 	}
