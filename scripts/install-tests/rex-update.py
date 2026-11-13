@@ -168,6 +168,31 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(rex.json_read(runtime / "source/packages/coding-agent/package.json")["version"], "1.0.1")
         self.assertFalse((self.fork / "upstream-only.txt").exists())
 
+    def test_partial_clone_skips_deleted_blobs_without_losing_release_ancestry(self):
+        historical = self.fork / "historical.bin"
+        historical.write_bytes(b"retired release asset\n" * 50000)
+        self.commit(self.fork, "historical asset")
+        blob = rex.git(self.fork, "rev-parse", "HEAD:historical.bin")
+        historical.unlink()
+        self.commit(self.fork, "remove historical asset")
+        rex.git(self.fork, "config", "uploadpack.allowFilter", "true")
+        self.bump_upstream()
+        home = self.base / "git-home"
+        home.mkdir()
+        origin = "https://rex-test.invalid/fork.git"
+        with mock.patch.dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config")):
+            # A real filtered Git transport, without public network access.
+            rex.git(None, "config", "--global", "url." + self.fork.as_uri() + ".insteadOf", origin)
+            runtime, fork_commit = rex.checkout_candidate(self.prefix, origin, branch="rex")
+            source = runtime / "source"
+            objects = rex.git(source, "rev-list", "--objects", "--missing=print", "HEAD")
+            self.assertIn("?" + blob, objects.splitlines())
+            self.assertTrue(rex.ancestor(source, self.base_commit, fork_commit))
+            proof = rex.integrate_upstream(source, str(self.upstream), "v1.0.1", self.base_commit)
+            self.assertTrue(rex.ancestor(source, proof["commit"], "HEAD"))
+            self.assertTrue(rex.ancestor(source, fork_commit, "HEAD"))
+            self.assertEqual(rex.json_read(source / "packages/coding-agent/package.json")["version"], "1.0.1")
+
     def test_activation_and_rollback_keep_previous_runtime_and_open_files_intact(self):
         old = self.install_old()
         before = (old / "runtime.json").read_bytes()

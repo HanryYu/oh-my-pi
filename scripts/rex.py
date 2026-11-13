@@ -171,12 +171,12 @@ def release_tag(upstream, requested=None):
 
 
 def checkout_candidate(prefix, origin, revision="HEAD", branch=None):
-    """A local clone, never a worktree of or a write into the user's checkout."""
+    """A private clone, never a worktree of or a write into the user's checkout."""
     identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     runtime = private_directory(prefix / "runtimes" / identifier)
     source = runtime / "source"
     try:
-        git(None, "clone", "--no-checkout", "--no-hardlinks", remote(str(origin)), str(source))
+        git(None, "clone", "--no-checkout", "--no-hardlinks", "--filter=blob:none", remote(str(origin)), str(source))
         if branch:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or ".." in branch:
                 raise RexError("Invalid fork branch")
