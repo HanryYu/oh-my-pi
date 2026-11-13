@@ -539,6 +539,7 @@ export async function executeWithKernelBase<
 					parentToolCallId: options.parentToolCallId,
 					toolSession: options.toolSession,
 					signal: options.signal,
+					cellTimeoutMs: executionTimeoutMs ?? options.idleTimeoutMs ?? 0,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
 					onReply: options.onReply,

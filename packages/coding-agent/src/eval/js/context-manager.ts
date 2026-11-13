@@ -78,6 +78,8 @@ interface PendingRun {
 	runState: VmRunState;
 	toolSession: ToolSession;
 	shadowCell?: EvalShadowCellSession;
+	/** The cell's `timeout` in ms, handed to prelude calls as their default budget. */
+	cellTimeoutMs?: number;
 	resolve(value: { value: unknown }): void;
 	reject(error: Error): void;
 	toolCalls: Map<string, AbortController>;
@@ -519,6 +521,7 @@ async function runOnce(
 		packageEnvironment?: string;
 		code: string;
 		filename: string;
+		timeoutMs?: number;
 		runState: VmRunState;
 		expectedRevision?: number;
 		expectedDigest?: string;
@@ -531,6 +534,7 @@ async function runOnce(
 		runState: options.runState,
 		toolSession: options.session,
 		shadowCell: getActiveEvalShadowCell(),
+		cellTimeoutMs: options.timeoutMs ?? 0,
 		resolve,
 		reject,
 		toolCalls: new Map(),
@@ -840,6 +844,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			parentToolCallId: pending.runState.parentToolCallId,
 			session: pending.toolSession,
 			signal: ctrl.signal,
+			cellTimeoutMs: pending.cellTimeoutMs,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
 			onReply: pending.runState.onReply,
