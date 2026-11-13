@@ -40,12 +40,14 @@ end
 local function fixture(with_neighbor)
   local serial = 0
   local view = { active_window_id = "work", windows = {
-    { window_id = "work", focused_block_id = "main", layers = {
-      { layer_id = "tiled", layout = with_neighbor and { split = {
+    { window_id = "work", label = "Window 12345678", focused_block_id = "main", layers = {
+      { layer_id = "tiled", blocks = { { block_id = "main", owner = "app-owner" } },
+        layout = with_neighbor and { split = {
         direction = "horizontal", ratio = 0.5, before = block("main"), after = block("unrelated") } } or block("main") }
     } }
   } }
   local function next_id() serial = serial + 1; return "observer-" .. serial end
+  local client = { window_id = "work", switches = 0 }
   local function locate(id)
     for _, w in ipairs(view.windows) do for _, l in ipairs(w.layers) do
       if has(l.layout, id) then return w, l end
@@ -58,6 +60,22 @@ local function fixture(with_neighbor)
   api.call = function(method, args)
     if method == "session.attach" or method == "session.disown_block" then return {} end
     if method == "session.view" then return clone(view) end
+    if method == "session.set_window_label" then
+      for _, w in ipairs(view.windows) do
+        if w.window_id == args.window_id then w.label = args.label; return {} end
+      end
+      error("missing label target")
+    end
+    if method == "client.inspect" then
+      return { client = { info = { kind = args.client_id == "app-owner" and "app" or "cli" } } }
+    end
+    if method == "client.perform" then
+      assert(args.client_id == "app-owner", "only the source pane's app may be switched")
+      client.switches = client.switches + 1
+      if client.refused then return nil, "Remote Control is disabled" end
+      client.window_id = args.args.window_id
+      return { performed_by = args.client_id }
+    end
     if method == "session.new_split" then
       local w, l = locate(args.anchor_id); assert(w, "missing anchor")
       local id = next_id(); l.layout = insert(l.layout, args.anchor_id, block(id), args)
@@ -66,7 +84,7 @@ local function fixture(with_neighbor)
     end
     if method == "session.new_window" then
       local id = next_id()
-      local w = { window_id = "window-" .. id, focused_block_id = id,
+      local w = { window_id = "window-" .. id, label = args.window_label, focused_block_id = id,
         layers = { { layer_id = "tiled-" .. id, layout = block(id) } } }
       view.windows[#view.windows + 1] = w
       if args.focus then view.active_window_id = w.window_id end
@@ -118,7 +136,7 @@ local function fixture(with_neighbor)
   local function request(kind, key, selected_view)
     c:event { type = "request", root = "/private/root", view = selected_view or "panel", request = { type = kind, key = key } }
   end
-  return { c = c, source = source, update = update, request = request, view = view,
+  return { c = c, source = source, update = update, request = request, view = view, client = client,
     locate = locate, api = api, messages = messages, wrong_pid = function() process_pid = 999 end,
     state = function() return c.roots["/private/root"] end }
 end
@@ -130,6 +148,14 @@ check(s.panel ~= nil and not s.hidden, "show opens the panel")
 check(f.view.windows[1].layers[1].layout.split.ratio == 0.75, "conversation keeps its proportional width")
 check(f.view.windows[1].focused_block_id == "main", "opening observer preserves focus")
 local panel = s.panel
+check(f.view.windows[1].label == "project", "a reused terminal tab gets a project label")
+f.source.main.title = "Fix workspace selection"
+f.update()
+check(f.view.windows[1].label == "Fix workspace selection", "native session title replaces the project fallback")
+f.view.windows[1].label = "My workspace"
+f.source.main.title = "A later native title"
+f.update()
+check(f.view.windows[1].label == "My workspace", "manual tab names survive later automatic title updates")
 f.update()
 check(s.panel == panel, "duplicate snapshots do not create another panel")
 f.request("select", "A:1")
@@ -179,8 +205,48 @@ local main_window = neighbors.locate("main")
 local other_window = neighbors.locate("unrelated")
 check(main_window.window_id ~= other_window.window_id, "moves only own conversation into a workspace tab")
 check(other_window.window_id == "work", "unrelated pane remains in its original tab")
+check(neighbors.view.active_window_id == main_window.window_id and main_window.focused_block_id == "main",
+  "the moved conversation, not the observer, has server focus")
+check(neighbors.client.window_id == main_window.window_id, "the source app selects the new workspace tab")
+neighbors.client.window_id = "another-tab"
+neighbors.source.main.title = "Updated session title"
+neighbors.update()
+check(main_window.label == "Updated session title" and neighbors.client.window_id == "another-tab"
+  and neighbors.client.switches == 1, "title and progress updates never pull the client back")
 neighbors.c:shutdown()
 check(neighbors.locate("unrelated") ~= nil and neighbors.locate("main") ~= nil, "shutdown never closes main or unrelated programs")
+
+local background = fixture(true)
+background.view.active_window_id = "another-server-window"
+background.update()
+check(background.client.window_id == background.state().window,
+  "another server-active window cannot leave the source app on the old tab")
+background.c:shutdown()
+
+local refused = fixture(true)
+refused.client.refused = true
+refused.update()
+check(refused.state().panel and refused.locate("main") and refused.state().notice_error
+  and refused.client.window_id == "work", "denied client control is reported without destroying the workspace")
+refused.c:shutdown()
+
+local manual_restart = fixture(false)
+manual_restart.update()
+manual_restart.view.windows[1].label = "Pinned workspace"
+manual_restart.source.main.title = "First native title"
+manual_restart.update()
+manual_restart.c:shutdown()
+local manual_saved
+for _, message in ipairs(manual_restart.messages) do
+  if message.type == "publish" and message.name == "workspace.json" then manual_saved = message.data end
+end
+local manual_recovery = Controller.new(manual_restart.api, function() end, "/module", 505)
+manual_restart.source.main.title = "Title after watcher restart"
+manual_recovery:event { type = "source", root = "/private/root",
+  source = clone(manual_restart.source), layout = manual_saved }
+check(manual_restart.view.windows[1].label == "Pinned workspace",
+  "an orderly watcher restart retains the user's tab name when recreating its panel")
+manual_recovery:shutdown()
 
 local denied = fixture(false)
 denied.wrong_pid(); denied.update()

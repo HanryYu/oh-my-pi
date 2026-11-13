@@ -324,7 +324,7 @@ class NativeLiveState {
 	}
 }
 
-type MainState = { state: State; intent: string; cwd: string; startedAt: number };
+type MainState = { state: State; intent: string; cwd: string; title?: string; startedAt: number };
 class Workspace {
 	#registry: Pick<AgentRegistryApi, "onChange" | "get">;
 	#unsubscribe: () => void;
@@ -441,6 +441,7 @@ class Workspace {
 
 	flush(): void {
 		try {
+			this.#main.title = this.ctx.sessionManager.getSessionName();
 			const agents = this.#agents();
 			const snapshot = JSON.stringify({ v: 3, pid: process.pid, session: process.env.REX_SESSION,
 				anchor: process.env.REX_BLOCK, sessionId: this.sessionId,

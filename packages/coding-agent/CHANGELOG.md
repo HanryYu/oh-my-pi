@@ -14,6 +14,8 @@
 - Official `v18.20.0` updates retain the native Rex bridge while excluding inline extension IDs from inherited module paths.
 - Fork updates omit historical file contents from the initial Git transfer while retaining full ancestry for official-release merges.
 - Validated updates share a private dependency cache instead of downloading unchanged packages for every candidate.
+- New Rex workspace tabs open in the conversation's owning app with input focused on the conversation.
+- Rex workspace tabs follow native session titles, use the project name before a title exists, and preserve subsequent manual renames.
 
 ## [18.20.0] - 2026-11-12
 

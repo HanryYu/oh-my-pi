@@ -54,7 +54,8 @@ test("native request ownership, worker evidence, park/removal and fail-closed ev
 	function factory(id: string, kind: string, file: string): FakeAgent {
 		const handlers = new Map<string, Hook>();
 		const channels = new Map<string, Set<(event: Record<string, unknown>) => void>>();
-		const manager = { getSessionId: () => file, getSessionFile: () => file, getArtifactsDir: () => file.slice(0, -6) };
+		const manager = { getSessionId: () => file, getSessionFile: () => file,
+			getSessionName: () => undefined, getArtifactsDir: () => file.slice(0, -6) };
 		const ctx = { agent: { id, kind }, cwd: "/tmp", sessionManager: manager,
 			setTimeout(callback: () => void) { const id = ++timerId; timers.set(id, { callback, repeat: false }); return id; },
 			setInterval(callback: () => void) { const id = ++timerId; timers.set(id, { callback, repeat: true }); return id; },

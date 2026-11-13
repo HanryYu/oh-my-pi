@@ -2,6 +2,8 @@
 local Controller = {}
 Controller.__index = Controller
 local terminal = "com.superlogical.terminal"
+local dir = debug.getinfo(1, "S").source:match("^@?(.*/)") or "./"
+local ui = dofile(dir .. "ui.lua")
 
 local function blocks(node, out)
   out = out or {}
@@ -28,6 +30,21 @@ local function agent_of(state, key)
   end
 end
 
+local function window_label(state)
+  local main = state.source.main
+  local label = type(main.title) == "string" and main.title:match("^%s*(.-)%s*$") or ""
+  if label == "" then label = main.cwd:match("([^/]+)/?$") or "OMP" end
+  return ui.clip(ui.sanitize(label:sub(1, 128), true), 64)
+end
+
+local function anchor_owner(window, anchor)
+  for _, layer in ipairs(window.layers or {}) do
+    for _, block in ipairs(layer.blocks or {}) do
+      if block.block_id == anchor then return block.owner end
+    end
+  end
+end
+
 function Controller.new(api, send, module, worker_pid)
   return setmetatable({ api = api, send = send, module = module, worker_pid = worker_pid,
     roots = {}, stopping = false, rex_binary = os.getenv("REX_WORKSPACE_REX") or "rex" }, Controller)
@@ -42,6 +59,34 @@ end
 function Controller:view(state)
   local result = self:call("session.view", { session_id = state.source.session })
   return result.view or result
+end
+
+function Controller:sync_label(state)
+  if not state.window or state.custom_label then return end
+  local label = window_label(state)
+  if label == state.window_label then return end
+  local window = window_of(self:view(state), state.source.anchor)
+  if not window or window.window_id ~= state.window then return end
+  if state.window_label and window.label ~= state.window_label then
+    state.custom_label = true
+    return
+  end
+  self:call("session.set_window_label", { session_id = state.source.session,
+    window_id = state.window, label = label })
+  state.window_label = label
+end
+
+function Controller:foreground(state, owner)
+  self:call("session.focus_block", { session_id = state.source.session, block_id = state.source.anchor })
+  if not owner then return end
+  local client, err = self.api.call("client.inspect", { client_id = owner })
+  if client and client.client and client.client.info and client.client.info.kind == "app" then
+    local _, switch_err = self.api.call("client.perform", { client_id = owner, action = "session.select",
+      session_id = state.source.session, block_id = state.source.anchor, timeout_ms = 1500,
+      args = { session_id = state.source.session, window_id = state.window } })
+    err = switch_err
+  end
+  if err then self:notice(state, "Cannot switch to workspace: " .. tostring(err), true) end
 end
 
 function Controller:log(message)
@@ -69,6 +114,7 @@ function Controller:publish(state)
     sessionId = source.sessionId, panel = state.panel, detail = state.detail,
     taskId = source.taskId,
     preview = state.preview, previewLayer = state.preview_layer, window = state.window,
+    windowLabel = state.window_label, customLabel = state.custom_label,
     selected = state.selected, requestSeq = state.request_seq, hidden = state.hidden,
     sidebarPercent = state.width })
   self:write(state, "view.json", { v = 1, root = state.root, main = source.main,
@@ -178,6 +224,7 @@ function Controller:adopt(state, saved)
   local view, owner = self:valid_anchor(state)
   state.validated = true
   state.request_seq = tonumber(saved.requestSeq) or -1
+  state.window_label, state.custom_label = saved.windowLabel, saved.customLabel == true
   state.hidden = saved.hidden == true
   if saved.panel and window_of(view, saved.panel) == owner then
     state.panel, state.window = saved.panel, owner.window_id
@@ -221,12 +268,13 @@ function Controller:show(state)
     for _, id in ipairs(blocks(layer.layout)) do neighbors[#neighbors + 1] = id end
   end
   local source = state.source
-  local focused = view.active_window_id == window.window_id and window.focused_block_id == source.anchor
+  local moved, owner = false, anchor_owner(window, source.anchor)
   if #neighbors > 1 then
-    local label = source.main.cwd:match("([^/]+)/?$") or "Workspace"
+    local label = window_label(state)
     local created = self:call("session.new_window", { session_id = source.session,
       window_label = label, focus = false, layout = self:layout("panel", state, "Workspace") })
     state.panel, state.window = created.block_ids[1], created.window_id
+    state.window_label, state.custom_label = label, false
     local ok, err = pcall(self.call, self, "session.move_block", { session_id = source.session,
       block_id = source.anchor, anchor_block_id = state.panel,
       direction = "horizontal", side = "before", ratio = ratio })
@@ -236,7 +284,7 @@ function Controller:show(state)
       self:close_block(state, panel)
       error(err, 0)
     end
-    if focused then self:call("session.focus_block", { session_id = source.session, block_id = source.anchor }) end
+    moved = true
   else
     local created = self:call("session.new_split", { session_id = source.session,
       anchor_id = source.anchor, direction = "horizontal", side = "after", ratio = ratio,
@@ -246,6 +294,8 @@ function Controller:show(state)
   state.hidden = false
   self:disown(state, state.panel)
   self:observe(state)
+  self:sync_label(state)
+  if moved then self:foreground(state, owner) end
   self:publish(state)
 end
 
@@ -335,6 +385,10 @@ function Controller:source(event)
     else self:hide(state) end
   elseif not state.hidden and not state.observed then
     self:observe(state)
+  end
+  if state.panel and not state.hidden then
+    local ok, err = pcall(self.sync_label, self, state)
+    if not ok then self:notice(state, err, true) end
   end
   self:publish(state)
 end
