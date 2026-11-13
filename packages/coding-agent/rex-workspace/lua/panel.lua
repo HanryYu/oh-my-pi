@@ -10,20 +10,11 @@ local function fit(text, width)
     if ui.width(text) <= width then return text end
     return width > 0 and ui.clip(text, width - 1) .. "…" or ""
 end
-local function path_tail(path, width)
-    if ui.width(path) <= width then return path end
-    local chars, used, first = ui.unicode.chars(path), 1, 1
-    for i = #chars, 1, -1 do
-        used = used + ui.width(chars[i])
-        if used > width then first = i + 1; break end
-    end
-    return width > 0 and "…" .. ui.concat(chars, first) or ""
-end
 local statuses = {working = "running", idle = "done", completed = "done", failed = "failed", awaiting_input = "waiting"}
 function M.new(send)
     local self = {
         send = send, snapshot = {}, offset = 0, rows = {}, hits = {}, height = 24, width = 79,
-        notice = "", input = ui.input(), collapsed = {tools = true}, keyboard = false,
+        notice = "", input = ui.input(), collapsed = {["more-scripts"] = true}, keyboard = false,
     }
     function self:receive(snapshot)
         self.snapshot = snapshot
@@ -34,6 +25,11 @@ function M.new(send)
         end
         -- Keep a held click across status-only updates. Render validates its
         -- identity at the original screen coordinates before it can activate.
+    end
+    function self:script(id)
+        for _, script in ipairs((self.snapshot.project or {}).scripts or {}) do
+            if script.id == id then return script end
+        end
     end
     function self:project_rows()
         local s, rows = self.snapshot, {}
@@ -50,19 +46,43 @@ function M.new(send)
             item.group = id
             return not self.collapsed[id]
         end
+        if self.input_kind == "run-script" and self.pending_script then
+            local pending = self.pending_script
+            add(ui.field(pending, "label", pending.id), "heading", nil, "run:title")
+            local current = self:script(pending.id)
+            if current and current.state then
+                add(ui.field(current, "state", "") .. (current.pid and " · PID " .. tostring(current.pid) or ""),
+                    current.state == "failed" and "error" or "muted", nil, "run:state")
+            end
+            for _, field in ipairs({"cwd", "source", "command"}) do
+                local value = ui.field(pending, field, "", 1048576)
+                if value ~= "" then
+                    add("", "", nil, "run:gap:" .. field)
+                    for i, line in ipairs(ui.wrap(value, math.max(1, self.width))) do
+                        add(line, field == "command" and "" or "muted", nil, "run:" .. field .. ":" .. i)
+                    end
+                end
+            end
+            if current and current.logFile then
+                add("", "", nil, "run:gap:log")
+                for i, line in ipairs(ui.wrap(ui.field(current, "logFile", "", 4096), math.max(1, self.width))) do
+                    add(line, "muted", nil, "run:log:" .. i)
+                end
+            end
+            return rows
+        end
         if not next(s) then add("连接工作区…", "muted", nil, "connecting"); return rows end
         local cwd = ui.field(project, "cwd", ui.field(main, "cwd", ""), 4096):gsub("/+$", "")
-        local name = cwd:match("([^/]+)$") or (cwd == "" and "/" or cwd)
-        add(name, "heading", nil, "project")
-        local parent = cwd:match("^(.*)/[^/]+$")
-        if parent and parent ~= "" then add(path_tail(parent .. "/", self.width), "muted", nil, "path") end
-        local state = ui.field(main, "state", "idle")
-        local label = ({working = "Working", blocked = "Waiting", done = "Done", error = "Failed", idle = "Idle"})[state] or state
-        local intent = ui.field(main, "intent", "", 512)
-        add(label .. (intent ~= "" and " · " .. intent or ""), state == "error" and "error" or "muted", nil, "activity")
+        add(cwd:match("([^/]+)$") or (cwd == "" and "/" or cwd), "heading", nil, "project")
+        local editor = project.editor
+        if type(editor) == "table" and editor.available == true then
+            add("Open in " .. ui.field(editor, "label", "editor"), "accent", {"open-editor"}, "editor")
+        end
+        add("Terminal", "accent", {"open-terminal"}, "terminal")
         if project.git == true then
+            add("", "", nil, "gap:git")
             local changes = project.changes or {}
-            add("git · " .. ui.field(project, "branch", ui.field(project, "head", "No commits")), "muted", nil, "branch")
+            add("⎇ " .. ui.field(project, "branch", ui.field(project, "head", "No commits")), "muted", nil, "branch")
             local files = tonumber(changes.files) or 0
             local summary = "Changes · " .. files .. (files == 1 and " file" or " files")
             local detail = string.format("+%s -%s", changes.added or 0, changes.removed or 0)
@@ -70,27 +90,6 @@ function M.new(send)
             elseif changes.headExists == false then summary = "Changes · empty tree" end
             add(summary, "", {"diff"}, "changes", detail)
             add("Commit staged", "accent", {"commit"}, "commit", changes.staged and tostring(changes.staged) or nil)
-        end
-        local scripts = {}
-        for _, script in ipairs(project.scripts or {}) do
-            if type(script) == "table" and type(script.id) == "string" then scripts[#scripts + 1] = script end
-        end
-        if group("tools", "Project actions") then
-            add("Open in Cursor", "accent", {"open-editor"}, "editor")
-            for _, script in ipairs(scripts) do
-                add(ui.field(script, "label", script.id), "", {"run-script", script.id}, "script:" .. script.id)
-            end
-            add("Add script", "accent", {"add-script"}, "add-script")
-        end
-        local servers = {}
-        for _, server in ipairs(project.servers or {}) do
-            if type(server) == "table" and type(server.id) == "string" then servers[#servers + 1] = server end
-        end
-        if #servers > 0 and group("servers", "Servers", #servers) then
-            for _, server in ipairs(servers) do
-                local label = ui.field(server, "label", ui.field(server, "url", server.id))
-                add(label, "accent", {"open-url", server.id}, "server:" .. server.id, server.port and ":" .. tostring(server.port) or nil)
-            end
         end
         local agents = {}
         for _, agent in ipairs(s.agents or {}) do
@@ -103,6 +102,42 @@ function M.new(send)
                     (status == "failed" or status == "error") and "error" or "", {"select", agent.key}, "agent:" .. agent.key, statuses[status] or status)
                 item.selected = agent.key == s.selected
                 if item.selected then item[2] = "accent" end
+            end
+        end
+        local scripts, preferred, used = {}, {}, {}
+        for _, script in ipairs(project.scripts or {}) do
+            if type(script) == "table" and type(script.id) == "string" then scripts[#scripts + 1] = script end
+        end
+        local function take(script)
+            if #preferred < 4 and not used[script.id] then preferred[#preferred + 1], used[script.id] = script, true end
+        end
+        for _, script in ipairs(scripts) do if script.state == "running" then take(script) end end
+        for _, script in ipairs(scripts) do if script.id:match("^user%-") then take(script) end end
+        for _, kind in ipairs({"dev", "build", "test", "check"}) do
+            for _, script in ipairs(scripts) do if script.kind == kind and not used[script.id] then take(script); break end end
+        end
+        for _, script in ipairs(scripts) do take(script) end
+        local function script_row(script)
+            local label = ui.field(script, "label", script.id)
+            add((script.state == "running" and "" or "Run ") .. label,
+                script.state == "failed" and "error" or "", {"run-script", script.id}, "script:" .. script.id,
+                script.state and ui.field(script, "state", "") or nil)
+        end
+        if group("scripts", "Scripts", #scripts > 0 and #scripts or nil) then
+            for _, script in ipairs(preferred) do script_row(script) end
+            if #scripts > #preferred and group("more-scripts", "More scripts", #scripts - #preferred) then
+                for _, script in ipairs(scripts) do if not used[script.id] then script_row(script) end end
+            end
+            add("Add script", "accent", {"add-script"}, "add-script")
+        end
+        local servers = {}
+        for _, server in ipairs(project.servers or {}) do
+            if type(server) == "table" and type(server.id) == "string" then servers[#servers + 1] = server end
+        end
+        if #servers > 0 and group("servers", "Servers", #servers) then
+            for _, server in ipairs(servers) do
+                add(ui.field(server, "label", ui.field(server, "url", server.id)), "accent",
+                    {"open-url", server.id}, "server:" .. server.id, server.port and ":" .. tostring(server.port) or nil)
             end
         end
         if #(s.diagnostics or {}) > 0 then
@@ -159,8 +194,18 @@ function M.new(send)
         end
         if self.press and not equal(self.hits[self.press.y], self.press.action) then self.press = nil end
         while #out < self.height - (self.input_kind and 1 or 0) - 1 do out[#out + 1] = row("") end
-        out[#out + 1] = row(fit((self.notice_error and self.notice ~= "" and "! " or "") .. self.notice, self.width), self.notice_error and "error" or "muted")
-        if self.input_kind and #out < self.height then
+        local footer = self.notice
+        if footer == "" and not self.input_kind then
+            local script = self.focus and self.focus[1] == "run-script" and self:script(self.focus[2])
+            local main = self.snapshot.main or {}
+            footer = script and ui.field(script, "command", "", 4096)
+                or ui.field(main, "intent", ui.field(main, "state", ""), 512)
+        end
+        out[#out + 1] = row(fit((self.notice_error and footer ~= "" and "! " or "") .. footer, self.width), self.notice_error and "error" or "muted")
+        if self.input_kind == "run-script" and #out < self.height then
+            local current = self.pending_script and self:script(self.pending_script.id)
+            out[#out + 1] = row(fit(current and current.state == "running" and "Esc Back" or "Enter Run · Esc Cancel", self.width), "accent")
+        elseif self.input_kind and #out < self.height then
             local labels = {["script-name"] = "Name", ["script-command"] = "Command", commit = "Commit staged"}
             local label = fit(labels[self.input_kind], math.max(0, self.width - 4)) .. " › "
             out[#out + 1] = row(fit(label .. self.input:display(math.max(1, self.width - ui.width(label))), self.width), "accent")
@@ -180,6 +225,12 @@ function M.new(send)
             self:move(0)
         elseif kind == "diagnostics" then
             self.notice, self.notice_error = "Use rex-omp to include eval agents", true
+        elseif kind == "run-script" then
+            local script = self:script(action[2])
+            if not script then return end
+            self.pending_script = {id = script.id, label = script.label, command = script.command,
+                cwd = script.cwd, source = script.source, offset = self.offset}
+            self.input_kind, self.offset, self.focus, self.press = "run-script", 0, nil, nil
         elseif kind == "add-script" or kind == "commit" then
             self.input_kind = kind == "add-script" and "script-name" or "commit"
             self.input, self.script_name = ui.input(), ""
@@ -190,6 +241,20 @@ function M.new(send)
         end
     end
     function self:submit()
+        if self.input_kind == "run-script" then
+            local pending = self.pending_script
+            local current = pending and self:script(pending.id)
+            if current and current.state == "running" then return end
+            self.input_kind, self.pending_script, self.offset = nil, nil, 0
+            self.focus = pending and {"run-script", pending.id} or nil
+            self.offset = pending and pending.offset or 0
+            if not current or current.command ~= pending.command then
+                self.notice, self.notice_error = "Command changed; select it again", true
+                return
+            end
+            self.send({type = "run-script", id = pending.id})
+            return
+        end
         local value = self.input:value():match("^%s*(.-)%s*$")
         if value == "" then
             self.notice = self.input_kind == "script-name" and "输入名称" or self.input_kind == "script-command" and "输入命令" or "输入提交信息"
@@ -219,8 +284,19 @@ function M.new(send)
     function self:event(event)
         if event == "quit" then self.send({type = "hide"}); return false end
         if self.input_kind then
-            if event == "escape" then self.input_kind, self.input, self.script_name, self.notice, self.notice_error, self.press = nil, ui.input(), "", "", false, nil
+            if event == "escape" then
+                local pending = self.pending_script
+                self.input_kind, self.pending_script, self.input, self.script_name, self.notice, self.notice_error, self.press = nil, nil, ui.input(), "", "", false, nil
+                if pending then self.offset, self.focus = pending.offset or 0, {"run-script", pending.id} end
             elseif event == "enter" then self:submit()
+            elseif self.input_kind == "run-script" then
+                if event == "up" then self.offset = math.max(0, self.offset - 1)
+                elseif event == "down" then self.offset = self.offset + 1
+                elseif event == "pageup" then self.offset = math.max(0, self.offset - math.max(1, self.available or 1))
+                elseif event == "pagedown" then self.offset = self.offset + math.max(1, self.available or 1)
+                elseif type(event) == "table" and event[1] == "mouse" and event[2] >= 64 and event[2] < 128 then
+                    self.offset = math.max(0, self.offset + (event[2] % 2 == 1 and 3 or -3))
+                end
             else self.input:event(event, self.input_kind == "script-name" and 160 or 4096) end
             return true
         end

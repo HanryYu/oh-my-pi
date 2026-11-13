@@ -277,11 +277,8 @@ class ProjectSlot:
         if kind == "run-script":
             return project.run_script(request.get("id"))
         if kind == "open-editor":
-            program = shutil.which("cursor", path=project._env.get("PATH"))
-            if not program:
-                raise ProjectError("未找到 Cursor 命令")
-            argument = project.cwd
-        elif kind == "open-url":
+            return project.open_editor()
+        if kind == "open-url":
             server = next((row for row in self.snapshot.get("servers", []) if row.get("id") == request.get("id")), None)
             if not server:
                 raise ProjectError("服务已停止，请刷新")
@@ -763,6 +760,14 @@ def main(argv=None):
     command.add_argument("--session")
     command.add_argument("--anchor")
     command.add_argument("--view", choices=("panel", "detail", "preview"), required=True)
+    command = commands.add_parser("scripts", help="Discover or save project commands without executing them")
+    command.add_argument("--cwd", required=True)
+    script_commands = command.add_subparsers(dest="script_action", required=True)
+    script_commands.add_parser("list")
+    add = script_commands.add_parser("add")
+    add.add_argument("--name", required=True)
+    add.add_argument("--command", dest="script_command", required=True)
+    add.add_argument("--replace", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "watch":
@@ -771,6 +776,22 @@ def main(argv=None):
             return start(args.module, args.rex)
         if args.command == "stop":
             return stop(args.module)
+        if args.command == "scripts":
+            cwd = Path(args.cwd).expanduser().resolve(strict=True)
+            if not cwd.is_dir():
+                raise ValueError("cwd must be an existing directory")
+            with tempfile.TemporaryDirectory(prefix="rex-project-commands-") as state_dir:
+                project = ProjectState(str(cwd), os.getpid(), state_dir)
+                try:
+                    message = project.add_script(args.name, args.script_command, replace=args.replace) if args.script_action == "add" else None
+                    result = project.script_snapshot()
+                    result["editor"] = project.editor_info()
+                    if message:
+                        result["message"] = message
+                    print(json.dumps(result, ensure_ascii=False))
+                finally:
+                    project.close()
+            return 0
         raw = sys.stdin.buffer.read(FRAME_LIMIT + 1)
         if len(raw) > FRAME_LIMIT:
             raise ValueError("request exceeds 1MiB")
@@ -797,7 +818,7 @@ def main(argv=None):
         return 0
     except KeyboardInterrupt:
         return 0
-    except (OSError, ValueError, TypeError, UnicodeError, RecursionError) as error:
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError, ProjectError) as error:
         print(text(error), file=sys.stderr)
         return 1
 

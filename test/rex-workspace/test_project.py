@@ -160,6 +160,182 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(failed["scripts"], [])
         self.assertIn("lockfile", failed["error"])
 
+    def test_confirmation_keeps_long_command_and_execution_cwd_without_env_secrets(self):
+        (self.repo / ".git").mkdir()
+        nested = self.repo / "nested"
+        nested.mkdir()
+        command = "printf '%s' '" + "x" * 12000 + "\x1b" + "tail'"
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"task": command}}))
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "launch.json").write_text(json.dumps({
+            "configurations": [{"name": "service", "program": "/bin/true",
+                                "cwd": "nested", "env": {"TOKEN": "DO_NOT_EXPOSE_ENV_SECRET"}}]}))
+        state = project.ProjectState(str(nested), os.getpid(), self.base / "confirmation-state")
+        self.addCleanup(state.close)
+        snapshot = state.script_snapshot()
+        self.assertEqual(snapshot["errors"], [])
+        scripts = {script["label"]: script for script in snapshot["scripts"]}
+        self.assertEqual(scripts["task"]["command"], command.replace("\x1b", "�"))
+        self.assertEqual(scripts["task"]["cwd"], str(self.repo))
+        self.assertEqual(scripts["service"]["cwd"], str(nested))
+        self.assertNotIn("DO_NOT_EXPOSE_ENV_SECRET", json.dumps(snapshot))
+
+    def test_discovery_reads_taskfiles_without_evaluating_repository_code(self):
+        marker = self.repo / "should-not-exist"
+        (self.repo / "Makefile").write_text(
+            "SIDE_EFFECT := $(shell touch %s)\n.PHONY: build\nbuild:\n\t@touch %s\n"
+            "%%.o: %%.c\n\tcc $<\n" % (marker, marker), encoding="utf-8")
+        (self.repo / "justfile").write_text(
+            "side_effect := `touch %s`\n"
+            "data := '''\nnot_a_recipe:\n'''\n"
+            "check:\n    touch %s\n"
+            "required value:\n    echo {{value}}\n"
+            "optional value='hello world':\n    echo {{value}}\n"
+            "many *values:\n    echo {{values}}\n"
+            "one +values:\n    echo {{values}}\n" % (marker, marker), encoding="utf-8")
+        with mock.patch.object(project.subprocess, "run") as run, mock.patch.object(project.subprocess, "Popen") as launch:
+            snapshot = self.state.script_snapshot()
+            run.assert_not_called()
+            launch.assert_not_called()
+        self.assertFalse(marker.exists())
+        self.assertEqual({script["label"] for script in snapshot["scripts"]}, {"build", "check", "optional", "many"})
+        self.assertTrue(all("state" not in script for script in snapshot["scripts"]))
+        self.assertFalse(snapshot["errors"])
+
+    def test_launch_jsonc_preserves_literal_args_cwd_env_and_revalidates_changes(self):
+        directory = self.repo / "service"
+        directory.mkdir()
+        config = self.repo / ".claude" / "launch.json"
+        config.parent.mkdir()
+        config.write_text('''{
+          // No discovery-time execution.
+          "configurations": [{
+            "name": "service",
+            "runtimeExecutable": "/bin/sh",
+            "runtimeArgs": ["-c",],
+            "program": "printf '%s|%s|%s' \\"$PWD\\" \\"$MESSAGE\\" \\"$1\\"",
+            "args": ["launch", "https://example.invalid/a,}"],
+            "cwd": "${workspaceFolder}/service",
+            "env": {"MESSAGE": "/* literal */",},
+          },],
+        }''', encoding="utf-8")
+        snapshot = self.state.script_snapshot()
+        self.assertEqual(snapshot["errors"], [])
+        script = snapshot["scripts"][0]
+        self.state.run_script(script["id"])
+        self.state._children[-1].wait(timeout=5)
+        finished = self.state.script_snapshot()["scripts"][0]
+        self.assertEqual(finished["state"], "done")
+        self.assertEqual(Path(finished["logFile"]).read_text(), str(directory) + "|/* literal */|https://example.invalid/a,}")
+        data = project.ProjectState._read_json(config, jsonc=True)
+        data["configurations"][0]["env"]["MESSAGE"] = "changed"
+        config.write_text(json.dumps(data), encoding="utf-8")
+        with mock.patch.object(project.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(project.ProjectError, "已变化"):
+                self.state.run_script(script["id"])
+            launch.assert_not_called()
+
+    def test_launch_outside_project_and_unsupported_desktop_semantics_are_not_runnable(self):
+        config = self.repo / ".claude" / "launch.json"
+        config.parent.mkdir()
+        configurations = [
+            {"name": "escape", "program": "/bin/true", "cwd": str(self.base)},
+            {"name": "port", "program": "/bin/true", "autoPort": True},
+            {"name": "debug", "program": "/bin/true", "preLaunchTask": "build"},
+        ]
+        config.write_text(json.dumps({"configurations": configurations}), encoding="utf-8")
+        snapshot = self.state.script_snapshot()
+        self.assertEqual(snapshot["scripts"], [])
+        self.assertEqual(len(snapshot["errors"]), 3)
+        self.assertTrue(any("cwd" in error for error in snapshot["errors"]))
+        self.assertTrue(any("autoPort" in error for error in snapshot["errors"]))
+        self.assertTrue(any("preLaunchTask" in error for error in snapshot["errors"]))
+
+    def test_nearest_launch_and_taskfile_edit_invalidate_execution_snapshot(self):
+        self.repository()
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "launch.json").write_text(json.dumps({
+            "configurations": [{"name": "ancestor", "program": "/bin/true"}]}))
+        directory = self.repo / "nested"
+        directory.mkdir()
+        (directory / ".claude").mkdir()
+        (directory / ".claude" / "launch.json").write_text(json.dumps({
+            "configurations": [{"name": "nearest", "program": "/bin/true"}]}))
+        taskfile = directory / "Makefile"
+        taskfile.write_text("build:\n\ttrue\n")
+        nested = project.ProjectState(str(directory), os.getpid(), self.base / "nested-state")
+        self.addCleanup(nested.close)
+        scripts = nested.script_snapshot()["scripts"]
+        self.assertEqual({script["label"] for script in scripts}, {"nearest", "build"})
+        key = next(script["id"] for script in scripts if script["label"] == "build")
+        taskfile.write_text("build:\n\tfalse\n")
+        with mock.patch.object(project.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(project.ProjectError, "已变化"):
+                nested.run_script(key)
+            launch.assert_not_called()
+
+    def test_declared_package_manager_cannot_silently_conflict_with_lockfile(self):
+        (self.repo / "package.json").write_text(json.dumps({
+            "packageManager": "pnpm@10.0.0", "scripts": {"build": "true"}}))
+        (self.repo / "yarn.lock").write_text("")
+        snapshot = self.state.script_snapshot()
+        self.assertEqual(snapshot["scripts"], [])
+        self.assertTrue(any("packageManager" in error and "lockfile" in error for error in snapshot["errors"]))
+
+    def test_same_custom_name_is_idempotent_and_replacement_requires_explicit_permission(self):
+        self.state.add_script("Task", "true")
+        first = self.state.script_snapshot()["scripts"][0]
+        self.state.add_script("Task", "true")
+        self.assertEqual(self.state.script_snapshot()["scripts"], [first])
+        with self.assertRaises(project.ProjectError):
+            self.state.add_script("Task", "false")
+        self.assertEqual(self.state._custom_scripts(), [{"name": "Task", "command": "true"}])
+        self.state.add_script("Task", "false", replace=True)
+        self.assertEqual(self.state._custom_scripts(), [{"name": "Task", "command": "false"}])
+        with mock.patch.object(project.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(project.ProjectError, "已变化"):
+                self.state.run_script(first["id"])
+            launch.assert_not_called()
+
+    def test_running_script_is_not_duplicated_and_exit_failure_is_not_healthy(self):
+        self.state.add_script("Task", "unused fixture")
+        script = self.state.script_snapshot()["scripts"][0]
+        child = mock.Mock(pid=12345)
+        child.poll.return_value = None
+        with mock.patch.object(project.subprocess, "Popen", return_value=child) as launch:
+            self.state.run_script(script["id"])
+            self.state.run_script(script["id"])
+            self.assertEqual(launch.call_count, 1)
+        running = self.state.script_snapshot()["scripts"][0]
+        self.assertEqual(running["state"], "running")
+        self.assertIsNone(running["exitCode"])
+        self.assertTrue(Path(running["logFile"]).is_file())
+        child.poll.return_value = 7
+        failed = self.state.script_snapshot()["scripts"][0]
+        self.assertEqual((failed["state"], failed["exitCode"]), ("failed", 7))
+        another = project.ProjectState(str(self.repo), os.getpid(), self.base / "restarted")
+        self.addCleanup(another.close)
+        self.assertNotIn("state", another.script_snapshot()["scripts"][0])
+        with mock.patch.object(project.subprocess, "Popen", side_effect=FileNotFoundError("missing runner")):
+            with self.assertRaises(project.ProjectError):
+                self.state.run_script(script["id"])
+        failed_launch = self.state.script_snapshot()
+        self.assertNotIn("state", failed_launch["scripts"][0])
+        self.assertTrue(any("missing runner" in error for error in failed_launch["errors"]))
+        self.assertTrue(any("missing runner" in path.read_text() for path in self.state.state_dir.glob("script-*.log")))
+
+    def test_editor_absence_is_not_faked_and_discovery_does_not_open_applications(self):
+        with mock.patch.object(project.shutil, "which", return_value=None), mock.patch.object(project.Path, "is_file", return_value=False), mock.patch.object(self.state, "_run") as run:
+            self.assertIsNone(self.state.editor_info())
+            with self.assertRaises(project.ProjectError):
+                self.state.open_editor()
+            run.assert_not_called()
+        with mock.patch.object(project.shutil, "which", side_effect=lambda executable, **kwargs: "/tools/zed" if executable == "zed" else None), mock.patch.object(project.Path, "is_file", return_value=False), mock.patch.object(self.state, "_run") as run:
+            self.assertEqual(self.state.editor_info(), {"label": "Zed", "available": True})
+            run.assert_not_called()
+            self.state.open_editor()
+            run.assert_called_once_with(["/tools/zed", str(self.repo)])
+
     def test_commit_includes_only_index_and_retains_hook_failures(self):
         self.repository()
         path = self.repo / "tracked.txt"

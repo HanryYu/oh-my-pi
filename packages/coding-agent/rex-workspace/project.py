@@ -9,6 +9,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -94,7 +97,8 @@ class ProjectState:
         self.omp_executable = omp_executable
         self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.state_dir, 0o700)
-        self.root = self.cwd
+        self.root = next((str(path) for path in (Path(self.cwd), *Path(self.cwd).parents)
+                          if (path / ".git").exists()), self.cwd)
         config_home = os.environ.get("XDG_CONFIG_HOME", "")
         if not os.path.isabs(config_home):
             config_home = str(Path.home() / ".config")
@@ -102,6 +106,8 @@ class ProjectState:
         self._lock = threading.RLock()
         self._scripts = {}
         self._children = []
+        self._script_runs = {}
+        self._script_failures = {}
         self._owned_pids = {}
         self._file_counts = {}
         self._supervisor_at = None
@@ -238,12 +244,28 @@ class ProjectState:
             directory = directory.parent
 
     @staticmethod
-    def _read_json(path):
-        # Configuration is small; refuse accidentally reading a generated giant file.
+    def _read_text(path):
+        # Discovery never evaluates project configuration or invokes its tools.
         with path.open("rb") as stream:
             raw = stream.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             raise ProjectError("配置超过 1MiB: " + str(path))
+        try:
+            return raw.decode("utf-8-sig")
+        except UnicodeError as error:
+            raise ProjectError("配置 UTF-8 无效: " + str(path)) from error
+
+    @classmethod
+    def _read_json(cls, path, jsonc=False):
+        raw = cls._read_text(path)
+        if jsonc:
+            # Match strings first so comment markers and commas inside argv/env
+            # remain literal. JSONC supports comments and trailing commas only.
+            string = r'"(?:\\.|[^"\\])*"'
+            raw = re.sub(string + r"|//[^\r\n]*|/\*[\s\S]*?\*/",
+                         lambda match: match[0] if match[0].startswith('"') else " ", raw)
+            raw = re.sub(string + r"|,\s*(?=[}\]])",
+                         lambda match: match[0] if match[0].startswith('"') else "", raw)
         try:
             return json.loads(raw)
         except (ValueError, UnicodeError) as error:
@@ -272,47 +294,252 @@ class ProjectState:
             raise ProjectError("命令不能为空、含 NUL/无效 Unicode 或超过 16384 字符")
         return name.strip(), command
 
+    def _nearest_file(self, names):
+        directory = Path(self.cwd)
+        while _within(directory, self.root):
+            for name in names:
+                path = directory / name
+                if path.is_file():
+                    if not _within(path, self.root):
+                        raise ProjectError("项目配置指向项目外: " + str(path))
+                    return path
+            if str(directory) == self.root or directory.parent == directory:
+                break
+            directory = directory.parent
+        return None
+
+    @staticmethod
+    def _script_kind(name):
+        words = set(re.split(r"[^a-z0-9]+", name.lower()))
+        for kind, labels in (("dev", {"dev", "start", "serve", "watch"}),
+                             ("build", {"build", "compile", "bundle"}),
+                             ("test", {"test", "spec"}),
+                             ("check", {"check", "lint", "typecheck", "format", "verify"})):
+            if words & labels:
+                return kind
+        return "task"
+
+    def _register_script(self, scripts, prefix, name, command, source, cwd, argv, stamp, env=None):
+        name, command = self._validate_script(name, command)
+        key = prefix + "-" + _identity(str(cwd), name, command, stamp)
+        scripts[key] = {"id": key, "label": name, "command": command, "source": source,
+                        "kind": self._script_kind(name), "_cwd": str(cwd), "_argv": argv}
+        if env is not None:
+            scripts[key]["_env"] = env
+
+    def _package_scripts(self, scripts):
+        package = self._package_directory()
+        if not package:
+            return
+        data = self._read_json(package / "package.json")
+        if not isinstance(data, dict) or not isinstance(data.get("scripts", {}), dict):
+            raise ProjectError("package.json scripts 必须为对象")
+        declared, lock_manager, scan, stamps = None, None, package, []
+        # Installed tools never decide which package manager owns a project.
+        while True:
+            manifest = scan / "package.json"
+            if manifest.is_file():
+                manifest_data = data if scan == package else self._read_json(manifest)
+                stamps.append(self._read_text(manifest))
+                if not isinstance(manifest_data, dict):
+                    raise ProjectError("package.json 必须为对象: " + str(manifest))
+                value = manifest_data.get("packageManager")
+                if declared is None and value is not None:
+                    if not isinstance(value, str) or not re.fullmatch(r"(npm|pnpm|yarn|bun)@[^\s\x00]+", value):
+                        raise ProjectError("不支持的 packageManager: " + _text(value))
+                    declared = value.split("@", 1)[0]
+            if lock_manager is None:
+                locks = (("bun.lock", "bun"), ("bun.lockb", "bun"), ("pnpm-lock.yaml", "pnpm"),
+                         ("yarn.lock", "yarn"), ("package-lock.json", "npm"), ("npm-shrinkwrap.json", "npm"))
+                found = [(scan / filename, runner) for filename, runner in locks if (scan / filename).is_file()]
+                if len({runner for _, runner in found}) > 1:
+                    raise ProjectError("同目录存在不同执行器的 lockfile，请先消除歧义: " + str(scan))
+                if found:
+                    lock_manager = found[0][1]
+                    stamps.extend(str(path) for path, _ in found)
+            if str(scan) == self.root or scan.parent == scan or not _within(scan.parent, self.root):
+                break
+            scan = scan.parent
+        if declared and lock_manager and declared != lock_manager:
+            raise ProjectError("packageManager 与最近 lockfile 执行器冲突")
+        manager = declared or lock_manager or "npm"
+        stamp = _identity(manager, *stamps)
+        for name, command in data.get("scripts", {}).items():
+            self._validate_script(name, command)
+            argv = [manager, "run", *(["--"] if name.startswith("-") else []), name]
+            self._register_script(scripts, "package", name, command, "package.json", package, argv, stamp)
+
+    def _launch_scripts(self, scripts, errors):
+        path = self._nearest_file((".claude/launch.json",))
+        if path is None:
+            return
+        data = self._read_json(path, jsonc=True)
+        if not isinstance(data, dict) or not isinstance(data.get("configurations"), list):
+            raise ProjectError(str(path) + ": configurations 必须为数组")
+        unknown = set(data) - {"version", "configurations"}
+        if unknown:
+            raise ProjectError(str(path) + ": 不支持的字段 " + ", ".join(sorted(unknown)))
+        workspace = path.parent.parent.resolve()
+        stamp = _identity(str(path), self._read_text(path))
+        names = set()
+        for index, item in enumerate(data["configurations"]):
+            try:
+                if not isinstance(item, dict):
+                    raise ProjectError("配置必须为对象")
+                unknown = set(item) - {"name", "runtimeExecutable", "runtimeArgs", "program", "args", "cwd", "env", "port", "autoPort"}
+                if unknown:
+                    raise ProjectError("不支持的启动字段: " + ", ".join(sorted(unknown)))
+                if "autoPort" in item and item["autoPort"] is not False:
+                    raise ProjectError("不支持 Desktop autoPort；请使用明确端口与命令")
+                if "port" in item and (type(item["port"]) is not int or not 1 <= item["port"] <= 65535):
+                    raise ProjectError("port 必须是 1–65535 的整数")
+                name = item.get("name")
+                self._validate_script(name, "launch")
+                if name.strip() in names:
+                    raise ProjectError("启动配置名称重复: " + name)
+                names.add(name.strip())
+
+                def literal(value):
+                    if not isinstance(value, str) or "\0" in value or any(unicodedata.category(c) == "Cs" for c in value):
+                        raise ProjectError("启动参数、cwd 和 env 必须为不含 NUL 的字符串")
+                    value = value.replace("${workspaceFolder}", str(workspace))
+                    if "${" in value:
+                        raise ProjectError("不支持的启动变量: " + _text(value))
+                    return value
+
+                def arguments(field):
+                    values = item.get(field, [])
+                    if not isinstance(values, list):
+                        raise ProjectError(field + " 必须为字符串数组")
+                    return [literal(value) for value in values]
+
+                executable, program = item.get("runtimeExecutable"), item.get("program")
+                if executable is None and program is None:
+                    raise ProjectError("缺少 runtimeExecutable 或 program")
+                if executable is None and item.get("runtimeArgs"):
+                    raise ProjectError("runtimeArgs 需要 runtimeExecutable")
+                argv = ([literal(executable)] + arguments("runtimeArgs")) if executable is not None else []
+                if program is not None:
+                    argv.append(literal(program))
+                argv.extend(arguments("args"))
+                if not argv[0].strip():
+                    raise ProjectError("启动程序不能为空")
+                directory = (workspace / Path(literal(item.get("cwd", str(workspace))))).resolve()
+                if not _within(directory, self.root) or not directory.is_dir():
+                    raise ProjectError("启动 cwd 必须是项目内已有目录: " + str(directory))
+                environment = item.get("env", {})
+                if not isinstance(environment, dict) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) for key in environment):
+                    raise ProjectError("env 必须为环境变量名称到字符串的对象")
+                environment = {key: literal(value) for key, value in environment.items()}
+                self._register_script(scripts, "launch", name, shlex.join(argv),
+                                      str(path.relative_to(self.root)), directory, argv, stamp, environment)
+            except ProjectError as error:
+                errors.append(_text("%s configurations[%d]: %s" % (path, index, error)))
+
+    def _taskfile_scripts(self, scripts, errors, just=False):
+        path = self._nearest_file(("justfile", "Justfile", ".justfile") if just else ("GNUmakefile", "makefile", "Makefile"))
+        if path is None:
+            return
+        raw = self._read_text(path)
+        stamp = _identity(str(path), raw)
+        names, blocked, private = set(), 0, False
+        multiline = None
+        for line in re.sub(r"\\\r?\n", " ", raw).splitlines():
+            if just:
+                if multiline:
+                    if multiline in line:
+                        multiline = None
+                    continue
+                delimiters = re.findall(r"'''|\"\"\"", line.split("#", 1)[0])
+                if delimiters:
+                    if delimiters.count(delimiters[0]) % 2:
+                        multiline = delimiters[0]
+                    continue
+            if not line or line[0].isspace() or line.startswith("#"):
+                continue
+            if just:
+                if line.startswith("["):
+                    private = private or bool(re.search(r"\bprivate\b", line))
+                    continue
+                if re.match(r"(import|mod)\s", line):
+                    errors.append(str(path) + ": 静态发现不展开 just import/mod")
+                match = re.match(r"@?([A-Za-z_][A-Za-z0-9_-]*)([^:]*):(?![=])", line)
+                if not match:
+                    private = False
+                    continue
+                try:
+                    parameters = shlex.split(match[2], comments=True)
+                except ValueError:
+                    errors.append(str(path) + ": 无法静态解析 recipe 参数: " + match[1])
+                    private = False
+                    continue
+                required = any("=" not in parameter and not parameter.startswith("*") for parameter in parameters)
+                if not private and not required:
+                    names.add(match[1])
+                private = False
+            else:
+                if re.match(r"(define|ifdef|ifndef|ifeq|ifneq)\b", line):
+                    blocked += 1
+                elif re.match(r"(endef|endif)\b", line):
+                    blocked = max(0, blocked - 1)
+                if blocked:
+                    continue
+                if re.match(r"\.RECIPEPREFIX\s*[:?+]?=", line):
+                    errors.append(str(path) + ": 自定义 recipe 前缀无法安全静态发现")
+                    return
+                if re.match(r"-?(include|sinclude)\s", line):
+                    errors.append(str(path) + ": 静态发现不展开 include")
+                match = re.match(r"([^:=]+?)\s*::?(?![=])\s*(.*)", line)
+                if not match or re.match(r"(?:override\s+|private\s+|export\s+)?[\w.-]+\s*[:?+!]?=", match[2]):
+                    continue
+                for name in match[1].split():
+                    if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", name):
+                        names.add(name)
+        for name in sorted(names):
+            argv = ["just", "--justfile", str(path), "--", name] if just else ["make", "-f", str(path), "--", name]
+            self._register_script(scripts, "just" if just else "make", name, shlex.join(argv),
+                                  str(path.relative_to(self.root)), path.parent, argv, stamp)
+
     def _load_scripts(self):
         scripts, errors = {}, []
-        package = self._package_directory()
-        if package:
+        for discover in (lambda: self._package_scripts(scripts),
+                         lambda: self._launch_scripts(scripts, errors),
+                         lambda: self._taskfile_scripts(scripts, errors),
+                         lambda: self._taskfile_scripts(scripts, errors, just=True)):
             try:
-                data = self._read_json(package / "package.json")
-                if not isinstance(data, dict) or not isinstance(data.get("scripts", {}), dict):
-                    raise ProjectError("package.json scripts 必须为对象")
-                # Prefer the nearest package/workspace lockfile, not installed tools.
-                manager, scan = "npm", package
-                while True:
-                    locks = (("bun.lock", "bun"), ("bun.lockb", "bun"), ("pnpm-lock.yaml", "pnpm"),
-                             ("yarn.lock", "yarn"), ("package-lock.json", "npm"), ("npm-shrinkwrap.json", "npm"))
-                    found = [runner for filename, runner in locks if (scan / filename).is_file()]
-                    if found:
-                        if len(set(found)) > 1:
-                            raise ProjectError("同目录存在不同执行器的 lockfile，请先消除歧义: " + str(scan))
-                        manager = found[0]
-                        break
-                    if str(scan) == self.root or scan.parent == scan or not _within(scan.parent, self.root):
-                        break
-                    scan = scan.parent
-                for name, command in data.get("scripts", {}).items():
-                    _, command = self._validate_script(name, command)
-                    argv = [manager, "run", *(["--"] if name.startswith("-") else []), name]
-                    key = "package-" + _identity(str(package), manager, name, command)
-                    scripts[key] = {"id": key, "label": name, "command": command, "source": "package.json",
-                                    "_cwd": str(package), "_argv": argv}
+                discover()
             except (OSError, ProjectError) as error:
                 errors.append(_text(error))
         try:
             for item in self._custom_scripts():
                 name, command = item["name"], item["command"]
-                key = "user-" + _identity(self.cwd, name, command)
-                scripts[key] = {"id": key, "label": name, "command": command, "source": "user",
-                                "_cwd": self.cwd, "_argv": ["/bin/sh", "-c", command]}
+                self._register_script(scripts, "user", name, command, "user", self.cwd,
+                                      ["/bin/sh", "-c", command], command)
         except (OSError, ProjectError) as error:
             errors.append(_text(error))
-        return scripts, errors
+        return scripts, list(dict.fromkeys(errors))
 
-    def add_script(self, name, command):
+    def script_snapshot(self):
+        with self._lock:
+            scripts, errors = self._load_scripts()
+            self._scripts = scripts
+            errors.extend(message for key, message in self._script_failures.items() if key in scripts)
+            public = []
+            for key, script in scripts.items():
+                # Confirmation needs the entire command, never a display-width
+                # preview. _text sanitizes controls without truncating content.
+                item = {key: _text(script[key]) for key in ("id", "label", "command", "source", "kind")}
+                item["cwd"] = _text(script["_cwd"])
+                run = self._script_runs.get(key)
+                if run:
+                    child = run["child"]
+                    code = child.poll()
+                    item.update(state="running" if code is None else "done" if code == 0 else "failed",
+                                pid=child.pid, exitCode=code, logFile=_text(run["logFile"]))
+                public.append(item)
+            return {"scripts": public, "errors": errors}
+
+    def add_script(self, name, command, replace=False):
         name, command = self._validate_script(name, command)
         with self._lock:
             if self._closed:
@@ -326,9 +553,15 @@ class ProjectState:
                 os.fchmod(lock.fileno(), 0o600)
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 scripts = self._custom_scripts()
-                if any(item["name"] == name for item in scripts):
-                    raise ProjectError("已有同名项目命令: " + name)
-                scripts.append({"name": name, "command": command})
+                existing = next((item for item in scripts if item["name"] == name), None)
+                if existing:
+                    if existing["command"] == command:
+                        return "已保存 " + _text(name)
+                    if not replace:
+                        raise ProjectError("已有同名项目命令；使用 replace 明确替换: " + name)
+                    existing["command"] = command
+                else:
+                    scripts.append({"name": name, "command": command})
                 fd, temporary = tempfile.mkstemp(prefix=".project-", dir=self.config.parent)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -352,17 +585,57 @@ class ProjectState:
             if id not in current:
                 raise ProjectError("命令已变化，请刷新后重试" + (": " + "; ".join(errors) if errors else ""))
             script = current[id]
+            running = self._script_runs.get(id)
+            if running and running["child"].poll() is None:
+                return "仍在运行 %s · PID %d · %s" % (_text(script["label"]), running["child"].pid, running["logFile"])
             fd, path = tempfile.mkstemp(prefix="script-", suffix=".log", dir=self.state_dir)
             try:
                 with os.fdopen(fd, "ab", buffering=0) as log:
                     os.fchmod(log.fileno(), 0o600)
-                    child = subprocess.Popen(script["_argv"], cwd=script["_cwd"], env=self._env,
+                    environment = dict(self._env, **script.get("_env", {}))
+                    environment["OMP_CONFIG_SYNC"] = "0"
+                    child = subprocess.Popen(script["_argv"], cwd=script["_cwd"], env=environment,
                                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                              start_new_session=True, close_fds=True)
             except OSError as error:
-                raise ProjectError("启动失败: " + _text(error) + "；日志: " + path) from error
+                with open(path, "ab") as log:
+                    log.write((_text(error) + "\n").encode("utf-8", "replace"))
+                message = "启动失败: " + _text(error) + "；日志: " + path
+                self._script_runs.pop(id, None)
+                self._script_failures[id] = message
+                raise ProjectError(message) from error
             self._children.append(child)
+            self._script_runs[id] = {"child": child, "logFile": path}
+            self._script_failures.pop(id, None)
         return "已启动 %s · PID %d · %s" % (_text(script["label"]), child.pid, path)
+
+    def _editor(self):
+        for label, executable, bundle, binary in (
+                ("Cursor", "cursor", "Cursor.app", "Cursor"),
+                ("VS Code", "code", "Visual Studio Code.app", "Electron"),
+                ("Zed", "zed", "Zed.app", "zed")):
+            command = shutil.which(executable, path=self._env.get("PATH", ""))
+            if command:
+                return label, [command, self.cwd]
+            for directory in (Path("/Applications"), Path.home() / "Applications"):
+                app = directory / bundle
+                if (app / "Contents" / "MacOS" / binary).is_file() and os.access("/usr/bin/open", os.X_OK):
+                    return label, ["/usr/bin/open", "-a", str(app), self.cwd]
+        return None
+
+    def editor_info(self):
+        editor = self._editor()
+        return {"label": editor[0], "available": True} if editor else None
+
+    def open_editor(self):
+        with self._lock:
+            if self._closed:
+                raise ProjectError("项目观察已关闭")
+            editor = self._editor()
+            if editor is None:
+                raise ProjectError("未检测到 Cursor、VS Code 或 Zed")
+            self._run(editor[1])
+            return "已打开 " + editor[0]
 
     def commit(self, message):
         if not isinstance(message, str) or not message.strip() or "\0" in message or len(message) > 65536:
@@ -567,12 +840,10 @@ class ProjectState:
         except (OSError, ValueError, ProjectError) as error:
             errors.append("Git: " + _text(error))
             snapshot["changes"]["incomplete"] = True
-        scripts, script_errors = self._load_scripts()
-        errors.extend(script_errors)
-        with self._lock:
-            self._scripts = scripts
-        snapshot["scripts"] = [{k: _text(v) if isinstance(v, str) else v for k, v in script.items() if not k.startswith("_")}
-                               for script in scripts.values()]
+        commands = self.script_snapshot()
+        errors.extend(commands["errors"])
+        snapshot["scripts"] = commands["scripts"]
+        snapshot["editor"] = self.editor_info()
         try:
             snapshot["servers"], server_errors = self._servers()
             errors.extend(server_errors)

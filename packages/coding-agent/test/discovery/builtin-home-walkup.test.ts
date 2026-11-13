@@ -8,13 +8,21 @@ import { afterEach, beforeEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
+import { getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@oh-my-pi/pi-coding-agent/capability/context-file";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { type Skill, skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { type Rule, ruleCapability } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { type SystemPrompt, systemPromptCapability } from "@oh-my-pi/pi-coding-agent/capability/system-prompt";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { loadSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import {
+	getSkillStorePath,
+	SKILLS_LOCK_FILE,
+	STORE_INTEGRITY_FILE,
+	writeSkillsLock,
+} from "@oh-my-pi/pi-coding-agent/skillshare/manifest";
 // Importing discovery registers all providers as a side effect.
 import "@oh-my-pi/pi-coding-agent/discovery";
 import { __resetDirsFromEnvForTests, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -22,7 +30,15 @@ import { __resetDirsFromEnvForTests, removeSyncWithRetries, setAgentDir } from "
 let tempDir: string;
 let home: string;
 // setAgentDir() rewrites these; restore them all so later test files see the original resolver.
-const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"] as const;
+const ENV_KEYS = [
+	"PI_CODING_AGENT_DIR",
+	"OMP_PROFILE",
+	"PI_PROFILE",
+	"PI_CONFIG_DIR",
+	"REX_SESSION",
+	"REX_BLOCK",
+	"REX_SUBAGENT_VIEWER",
+] as const;
 let savedEnv: Record<(typeof ENV_KEYS)[number], string | undefined>;
 
 function writeFile(filePath: string, content: string): void {
@@ -260,4 +276,128 @@ test("noncanonical home never becomes a native project config root", async () =>
 	expect((await loadNative<Rule>(ruleCapability.id, atHome)).some(rule => rule._source.level === "project")).toBe(
 		false,
 	);
+});
+
+test("Rex-enabled discovery exposes runtime workspace guidance through the real skill loader", async () => {
+	const cwd = path.join(tempDir, "project");
+	fs.mkdirSync(cwd, { recursive: true });
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	process.env.REX_SESSION = "fixture-session";
+	process.env.REX_BLOCK = "fixture-anchor";
+	delete process.env.REX_SUBAGENT_VIEWER;
+
+	const result = await loadSkills({ cwd, includeSkills: ["rex-omp-workspace"] });
+
+	expect(result.skills.map(skill => skill.filePath)).toEqual([
+		path.resolve(import.meta.dir, "../../rex-workspace/skills/rex-omp-workspace/SKILL.md"),
+	]);
+});
+
+test.each([
+	[undefined, undefined, undefined],
+	["fixture-session", undefined, undefined],
+	[undefined, "fixture-anchor", undefined],
+	["fixture-session", "fixture-anchor", "0"],
+])("workspace guidance stays absent without enabled Rex context (%s, %s, %s)", async (session, block, enabled) => {
+	const cwd = path.join(tempDir, "project");
+	fs.mkdirSync(cwd, { recursive: true });
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	for (const [key, value] of [
+		["REX_SESSION", session],
+		["REX_BLOCK", block],
+		["REX_SUBAGENT_VIEWER", enabled],
+	] as const) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+
+	const result = await loadSkills({ cwd, includeSkills: ["rex-omp-workspace"] });
+
+	expect(result.skills).toEqual([]);
+});
+
+test.each(["native-user", "agents-user", "native-project", "agents-project"])(
+	"an authored %s workspace skill keeps its name instead of the bundled guidance",
+	async source => {
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		process.env.REX_SESSION = "fixture-session";
+		process.env.REX_BLOCK = "fixture-anchor";
+		delete process.env.REX_SUBAGENT_VIEWER;
+		const roots: Record<string, string> = {
+			"native-user": path.join(tempDir, "isolated-agent", "skills"),
+			"agents-user": path.join(home, ".agents", "skills"),
+			"native-project": path.join(cwd, ".omp", "skills"),
+			"agents-project": path.join(cwd, ".agents", "skills"),
+		};
+		const authored = path.join(roots[source], "rex-omp-workspace", "SKILL.md");
+		writeFile(authored, "---\nname: rex-omp-workspace\ndescription: Project workflow\n---\nUse our workflow.\n");
+
+		const capability = await loadCapability<Skill>(skillCapability.id, { cwd });
+		const loaded = await loadSkills({ cwd, includeSkills: ["rex-omp-workspace"] });
+
+		expect(capability.items.find(skill => skill.name === "rex-omp-workspace")?.path).toBe(authored);
+		expect(loaded.skills.map(skill => skill.filePath)).toEqual([authored]);
+	},
+);
+
+test.each(["user", "project"] as const)(
+	"an installed skillshare %s workspace skill is not displaced or duplicated by bundled guidance",
+	async level => {
+		const cwd = path.join(tempDir, "project");
+		fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		process.env.REX_SESSION = "fixture-session";
+		process.env.REX_BLOCK = "fixture-anchor";
+		delete process.env.REX_SUBAGENT_VIEWER;
+		const name = "rex-omp-workspace";
+		const version = "1.0.0";
+		const integrity = "sha512-workspace-fixture";
+		const store = getSkillStorePath("workspace", name, version);
+		writeFile(
+			path.join(store, "SKILL.md"),
+			`---\nname: ${name}\ndescription: Installed project workflow\n---\nUse the installed workflow.\n`,
+		);
+		writeFile(path.join(store, STORE_INTEGRITY_FILE), `${integrity}\n`);
+		const lockDir = level === "user" ? path.join(tempDir, "isolated-agent") : path.join(cwd, ".omp");
+		await writeSkillsLock(path.join(lockDir, SKILLS_LOCK_FILE), {
+			version: 1,
+			skills: {
+				[`@workspace/${name}`]: {
+					version,
+					integrity,
+					resolved: `/api/v1/skills/@workspace/${name}/versions/${version}/tarball`,
+				},
+			},
+		});
+
+		const loaded = await loadSkills({ cwd });
+		const installed = loaded.skills.filter(skill => skill.name === name);
+
+		expect(installed.map(skill => [skill.filePath, skill.source])).toEqual([
+			[path.join(fs.realpathSync(store), "SKILL.md"), `skillshare:${level}`],
+		]);
+		expect(loaded.skills.some(skill => skill.source === "rex-workspace:user")).toBe(false);
+	},
+);
+
+test("a managed workspace skill remains authoritative instead of bundled guidance claiming its name", async () => {
+	const cwd = path.join(tempDir, "project");
+	fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	process.env.REX_SESSION = "fixture-session";
+	process.env.REX_BLOCK = "fixture-anchor";
+	delete process.env.REX_SUBAGENT_VIEWER;
+	const managed = path.join(getManagedSkillsDir(), "rex-omp-workspace", "SKILL.md");
+	writeFile(
+		managed,
+		"---\nname: rex-omp-workspace\ndescription: Learned project workflow\n---\nUse the learned workflow.\n",
+	);
+
+	const loaded = await loadSkills({ cwd });
+	const selected = loaded.skills.filter(skill => skill.name === "rex-omp-workspace");
+
+	expect(selected.map(skill => [skill.filePath, skill.source])).toEqual([[managed, "omp-managed:user"]]);
+	expect(loaded.skills.some(skill => skill.source === "rex-workspace:user")).toBe(false);
 });

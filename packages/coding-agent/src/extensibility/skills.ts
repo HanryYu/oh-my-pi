@@ -37,6 +37,7 @@ import userInvocationTemplate from "../prompts/skills/user-invocation.md" with {
 import { SKILLSHARE_PROVIDER_ID } from "../discovery/skillshare";
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
+import { REX_WORKSPACE_SKILLS_PROVIDER_ID } from "../rex/bridge";
 
 export { allowsSkillTokens, SKILL_TOKEN_RE };
 
@@ -244,7 +245,9 @@ export function resetActiveSkillsForTests(): void {
  */
 export function isNameClaimedByAuthoredSkill(name: string): boolean {
 	return getActiveSkills().some(
-		skill => skill.name === name && skill._source?.provider !== MANAGED_SKILLS_PROVIDER_ID,
+		skill => skill.name === name &&
+			skill._source?.provider !== MANAGED_SKILLS_PROVIDER_ID &&
+			skill._source?.provider !== REX_WORKSPACE_SKILLS_PROVIDER_ID,
 	);
 }
 
@@ -385,6 +388,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// patterns are matched against the final name the user actually sees.
 	const filteredSkills = result.all.filter(capSkill => {
 		if (capSkill._source.provider === MANAGED_SKILLS_PROVIDER_ID) return false;
+		if (capSkill._source.provider === REX_WORKSPACE_SKILLS_PROVIDER_ID) return false;
 		if (disabledSkillNames.has(capSkill.name)) return false;
 		if (!isSourceEnabled(capSkill._source)) return false;
 		return !matchesIgnorePatterns(capSkill.name);
@@ -548,7 +552,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		if (admit(skill, body, frontmatter, namespace) !== undefined) realPathSet.add(resolvedPath);
 	}
 
-	// Managed (auto-learn) skills resolve dead-last with first-wins. Source from
+	// Managed (auto-learn) skills resolve after authored sources with first-wins.
 	// result.all (pre-dedup): capability-level dedup runs BEFORE isSourceEnabled,
 	// so a managed skill can be shadowed by a higher-priority authored skill that
 	// is itself disabled here — managed must stay visible regardless of toggles.
@@ -569,7 +573,8 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const enabledAuthoredNames = new Set(
 		result.all
 			.filter(
-				capSkill => capSkill._source.provider !== MANAGED_SKILLS_PROVIDER_ID && isSourceEnabled(capSkill._source),
+				capSkill => capSkill._source.provider !== MANAGED_SKILLS_PROVIDER_ID &&
+					capSkill._source.provider !== REX_WORKSPACE_SKILLS_PROVIDER_ID && isSourceEnabled(capSkill._source),
 			)
 			.map(capSkill => capSkill.name),
 	);
@@ -606,6 +611,22 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			_source: capSkill._source,
 		});
 		realPathSet.add(resolvedPath);
+	}
+
+	// Runtime guidance is a fallback, never an authored override of installed skills.
+	for (const capSkill of result.all) {
+		if (capSkill._source.provider !== REX_WORKSPACE_SKILLS_PROVIDER_ID || skillMap.has(capSkill.name)) continue;
+		if (disabledSkillNames.has(capSkill.name) || !isSourceEnabled(capSkill._source) ||
+			matchesIgnorePatterns(capSkill.name) || !matchesIncludePatterns(capSkill.name)) continue;
+		admit({
+			name: capSkill.name,
+			description: typeof capSkill.frontmatter?.description === "string" ? capSkill.frontmatter.description : "",
+			filePath: capSkill.path,
+			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
+			source: `${capSkill._source.provider}:${capSkill.level}`,
+			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
+			_source: capSkill._source,
+		}, capSkill.content, capSkill.frontmatter, skillNamespace(capSkill));
 	}
 
 	const skills = Array.from(skillMap.values()).filter(skill => matchesIncludePatterns(skill.name));

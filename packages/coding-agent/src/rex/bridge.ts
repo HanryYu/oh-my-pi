@@ -504,6 +504,8 @@ class Workspace {
 	}
 }
 
+export const REX_WORKSPACE_SKILLS_PROVIDER_ID = "rex-workspace";
+
 export function rexWorkspaceEnabled(): boolean {
 	return process.env.REX_SUBAGENT_VIEWER !== "0" && Boolean(process.env.REX_SESSION && process.env.REX_BLOCK);
 }

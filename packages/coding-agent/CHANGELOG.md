@@ -7,6 +7,8 @@
 - Rex workspaces show current-task subagents, project changes and development servers beside the original conversation, with a proportional sidebar and one native read-only detail pane.
 - `rex-view` renders a selected subagent's original transcript and live in-flight content without creating a model session.
 - The fork's `rex-omp` installer supports validated official-release updates and rollback without replacing the official OMP installation.
+- The narrow Rex sidebar exposes detected GUI editors, a reusable project terminal, visible project scripts and actual script-process states. Launching a script requires command confirmation.
+- Project commands are discovered without execution from package scripts, supported Claude launch configurations, Make targets and parameter-free Just recipes. The bundled `rex-omp-workspace` skill can register verified private commands without starting them.
 
 ### Fixed
 

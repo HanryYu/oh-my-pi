@@ -13,6 +13,10 @@ rex-omp
 
 Run `rex-omp` in Rex. Start a new session after installing; existing conversations are not restarted. The default right side is 25%, configurable with `REX_WORKSPACE_WIDTH=15..35`. Selecting a subagent opens one lower-right pane; switching agents reuses it. A new user task clears historical agents, and removing the selected agent closes its pane.
 
+The sidebar exposes a detected GUI editor, a reusable project terminal, Git changes, current-task subagents, scripts and listening servers. Common development/build/test/check commands stay visible; additional scripts expand in place. Select a script to inspect its command and working directory, then press Enter to run. Running scripts show their observed process state and log path; hiding the observer does not stop them or close the project terminal.
+
+Commands are discovered without execution from package scripts and lockfiles, supported process definitions in `.claude/launch.json`, Make targets and parameter-free Just recipes. The bundled [`rex-omp-workspace` skill](packages/coding-agent/rex-workspace/skills/rex-omp-workspace/SKILL.md) teaches the agent to reuse these commands and save verified missing workflows through a private CLI. Discovery and saving never start services. This does not implement Claude Desktop's embedded browser, automatic verification or `autoPort`.
+
 The installer needs macOS, Python 3.9+, Git, Rex and `lsof`. It prepares a compatible private Bun and matching official native bindings. It does not replace Homebrew's `omp`, upgrade the global Bun, or change accounts, the composer, themes or global OMP settings. The fork skips the retired `rex-subagent-viewer` extension when loading extensions. Its files remain available to official OMP and configuration-sync peers.
 
 ## Update and recovery
@@ -29,7 +33,7 @@ Runtimes are immutable. Existing OMP sessions retain their source files; rollbac
 
 ### Verification
 
-Focused checks cover 37 native bridge/readonly/eval cases, 52 Python workspace/update cases, Lua controller transitions and 16 panel behavior groups. An independent Rex server exercised the real native task/eval engine with a scripted local provider: direct and eval launch attribution, assistant content before JSONL persistence, actual `←←` Agent Hub content, detail reuse/removal, new-task isolation and a real HTTP listener.
+Focused checks cover native bridge/readonly/eval cases, Python workspace/update behavior, Lua controller transitions and panel interactions. Initial integration validation used an independent Rex server and a scripted local provider: direct and eval launch attribution, assistant content before JSONL persistence, actual `←←` Agent Hub content, detail reuse/removal, new-task isolation and a real HTTP listener.
 
 Observation added no provider calls and did not modify the child transcripts. External model inference was not exercised.
 

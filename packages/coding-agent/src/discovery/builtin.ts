@@ -23,6 +23,7 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
+import { rexWorkspaceEnabled, REX_WORKSPACE_SKILLS_PROVIDER_ID } from "../rex/bridge";
 import { expandTilde } from "../tools/path-utils";
 import {
 	discoverRuleFromMarkdown,
@@ -364,6 +365,23 @@ registerProvider<Skill>(skillCapability.id, {
 	description: "Auto-generated managed skills from ~/.omp/agent/managed-skills",
 	priority: MANAGED_SKILLS_PRIORITY,
 	load: loadManagedSkills,
+});
+
+// Keep runtime-bundled guidance below every user/project skill provider.
+registerProvider<Skill>(skillCapability.id, {
+	id: REX_WORKSPACE_SKILLS_PROVIDER_ID,
+	displayName: "Rex Workspace",
+	description: "Bundled guidance for the native Rex workspace",
+	priority: 0,
+	load: ctx =>
+		rexWorkspaceEnabled()
+			? scanSkillsFromDir(ctx, {
+					dir: path.resolve(import.meta.dir, "../../rex-workspace/skills"),
+					providerId: REX_WORKSPACE_SKILLS_PROVIDER_ID,
+					level: "user",
+					requireDescription: true,
+				})
+			: Promise.resolve({ items: [] }),
 });
 
 // Slash Commands

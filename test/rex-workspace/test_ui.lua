@@ -25,7 +25,7 @@ end
 local function contains(value, needle) assert(value:find(needle, 1, true), "missing " .. needle) end
 local function absent(value, needle) assert(not value:find(needle, 1, true), "unexpected " .. needle) end
 local function snapshot(git)
-    return {v = 1, main = {state = "working", intent = "实现工作区"}, project = {host = "mac", cwd = "/project", git = git ~= false, branch = "main", changes = {added = 4, removed = 2, files = 1}, scripts = {}, servers = {}}, agents = {}}
+    return {v = 1, main = {state = "working", intent = "实现工作区"}, project = {host = "mac", cwd = "/project", editor = {label = "Cursor", available = true}, git = git ~= false, branch = "main", changes = {added = 4, removed = 2, files = 1}, scripts = {}, servers = {}}, agents = {}}
 end
 local function panel()
     local sent = {}
@@ -38,11 +38,6 @@ local function action_y(p, kind, id)
 end
 local function click(p, kind, id, release_x)
     p:render(p.width, p.height)
-    if (kind == "open-editor" or kind == "run-script" or kind == "add-script") and p.collapsed.tools then
-        local group_y = assert(action_y(p, "toggle", "tools"), "missing project actions")
-        p:event({"mouse", 0, 3, group_y, false}); p:event({"mouse", 0, 3, group_y, true})
-        p:render(p.width, p.height)
-    end
     local y = assert(action_y(p, kind, id), "missing action " .. kind)
     p:event({"mouse", 0, 3, y, false})
     p:event({"mouse", 0, release_x or 3, y, true})
@@ -91,11 +86,11 @@ test("Bounded JSONL framing waits for complete records", function()
     framing:feed('{"v":1}'); framing:finish(); eq(#events, 2); eq(#warnings, 4)
 end)
 test("Empty groups and non-git controls stay absent, project actions remain reachable", function()
-    local p, sent = panel(); p:receive(snapshot(false)); p:render(36, 30)
+    local p, sent = panel(); local s = snapshot(false); s.project.editor = nil; p:receive(s); p:render(36, 30)
     for _, kind in ipairs({"diff", "commit", "select", "open-url"}) do eq(action_y(p, kind), nil) end
     eq(action_y(p, "toggle", "servers"), nil); eq(action_y(p, "toggle", "agents"), nil)
     eq(action_y(p, "open-editor"), nil)
-    click(p, "open-editor"); eq(sent[1].type, "open-editor")
+    click(p, "open-terminal"); eq(sent[1].type, "open-terminal")
     click(p, "add-script"); eq(p.input_kind, "script-name")
 end)
 test("Activation requires same press and release, drag cancels", function()
@@ -130,18 +125,18 @@ test("Refreshes cannot substitute another agent or activate a moved target", fun
     p:receive(s); p:render(36, 30); p:event({"mouse", 0, 3, y, true}); eq(#sent, 0)
     y = assert(action_y(p, "select", "A:2"))
     p:event({"mouse", 0, 3, y, false})
-    s.project.servers = {{id = "server:1", label = "app", port = 3000}}
+    table.insert(s.agents, 1, {key = "B:1", name = "Second", status = "running"})
     p:receive(s); p:render(36, 30); p:event({"mouse", 0, 3, y, true}); eq(#sent, 0)
     click(p, "select", "A:2"); eq(sent[1].key, "A:2")
 end)
 test("Collapsed groups support keyboard expansion, activation and return to parent", function()
     local p, sent = panel()
-    click(p, "toggle", "tools")
+    click(p, "toggle", "scripts")
     p:event("left"); p:render(36, 30)
-    eq(p.focus[2], "tools"); eq(action_y(p, "open-editor"), nil)
-    p:event("right"); p:event("down"); p:event("enter"); eq(sent[1].type, "open-editor")
-    p:event("left"); p:render(36, 30); eq(p.focus[2], "tools")
-    eq(action_y(p, "open-editor"), nil)
+    eq(p.focus[2], "scripts"); eq(action_y(p, "add-script"), nil)
+    p:event("right"); p:event("down"); p:event("enter"); eq(p.input_kind, "script-name")
+    p:event("escape"); p:event("left"); p:render(36, 30); eq(p.focus[2], "scripts")
+    eq(action_y(p, "add-script"), nil)
     p:event("enter"); p:render(36, 30); assert(action_y(p, "add-script"))
 end)
 test("Forms send only complete explicit submissions", function()
@@ -157,24 +152,29 @@ test("Forms send only complete explicit submissions", function()
 end)
 test("Real project ids and registry generation are routed", function()
     local p, sent = panel(); local s = snapshot()
-    s.project.scripts = {{id = "package:dev", label = "dev"}}
+    s.project.scripts = {{id = "package:dev", label = "dev", command = "bun run dev"}}
     s.project.servers = {{id = "123:3000", label = "app", port = 3000}}
     s.agents = {{key = "A:2", name = "Worker", status = "parked"}}
     p:receive(s)
-    click(p, "run-script", "package:dev"); click(p, "open-url", "123:3000"); click(p, "select", "A:2"); click(p, "diff")
+    click(p, "run-script", "package:dev"); eq(#sent, 0); p:event("enter")
+    click(p, "open-url", "123:3000"); click(p, "select", "A:2"); click(p, "diff")
     eq(sent[1].id, "package:dev"); eq(sent[2].id, "123:3000"); eq(sent[3].key, "A:2"); eq(sent[4].type, "diff")
 end)
 test("Long agent list is keyboard reachable and q hides only UI", function()
     local p, sent = panel(); local s = snapshot()
     for i = 1, 40 do s.agents[i] = {key = "worker:" .. i, name = "Worker", status = "running"} end
-    p:receive(s); p:render(30, 8); p:event("end"); p:render(30, 8); assert(p.offset > 0)
+    p:receive(s); p:render(30, 8)
+    for _ = 1, #p.rows do if p.focus[2] ~= "worker:40" then p:event("down") end end
+    p:render(30, 8); assert(p.offset > 0)
     p:event("enter"); eq(sent[1].key, "worker:40")
     eq(p:event({"text", "q"}), false); eq(sent[2].type, "hide")
 end)
 test("Keyboard focus and scrolled targets keep their identities across list updates", function()
     local p = panel(); local s = snapshot()
     for i = 1, 40 do s.agents[i] = {key = "worker:" .. i, name = "Worker" .. i, status = "running"} end
-    p:receive(s); p:render(30, 8); p:event("end"); p:event("up"); p:render(30, 8)
+    p:receive(s); p:render(30, 8)
+    for _ = 1, #p.rows do if p.focus[2] ~= "worker:39" then p:event("down") end end
+    p:render(30, 8)
     local key, y = p.focus[2], assert(action_y(p, "select", p.focus[2]))
     table.insert(s.agents, 1, {key = "new:1", name = "New", status = "running"})
     s.agents[20].status = "parked"
@@ -183,6 +183,44 @@ test("Keyboard focus and scrolled targets keep their identities across list upda
     p:event("left"); p:render(30, 8)
     eq(p.focus[2], "agents"); assert(action_y(p, "toggle", "agents"))
     eq(action_y(p, "select", key), nil)
+end)
+test("Commands require confirmation and stale previews cannot execute", function()
+    local p, sent = panel(); local s = snapshot()
+    s.project.scripts = {{id = "dev", label = "dev", command = "bun run dev", cwd = "/project"}}
+    p:receive(s); click(p, "run-script", "dev")
+    eq(#sent, 0); contains(text(p:render(36, 30)), "bun run dev")
+    p:event("escape"); eq(#sent, 0); eq(p.focus[2], "dev")
+    click(p, "run-script", "dev")
+    s.project.scripts[1].command = "bun run different"; p:receive(s); p:event("enter")
+    eq(#sent, 0); eq(p.notice_error, true)
+    click(p, "run-script", "dev"); p:event("enter"); eq(sent[1].id, "dev")
+end)
+test("Running commands expose actual state but cannot be launched twice", function()
+    local p, sent = panel(); local s = snapshot()
+    s.project.scripts = {{id = "dev", label = "dev", command = "bun run dev", state = "running", pid = 42, logFile = "/logs/dev.log"}}
+    p:receive(s); click(p, "run-script", "dev"); p:event("enter")
+    eq(#sent, 0); contains(text(p:render(36, 30)), "PID 42"); contains(text(p:render(36, 30)), "/logs/dev.log")
+    p:event("escape"); s.project.scripts[1].state = "done"; p:receive(s)
+    click(p, "run-script", "dev"); p:event("enter"); eq(sent[1].id, "dev")
+end)
+test("Preferred workflows stay visible and other scripts remain reachable", function()
+    local p, sent = panel(); local s = snapshot()
+    for i = 1, 12 do s.project.scripts[#s.project.scripts + 1] = {id = "task-" .. i, label = "task-" .. i, kind = "task", command = "echo task"} end
+    for _, kind in ipairs({"dev", "build", "test", "check"}) do s.project.scripts[#s.project.scripts + 1] = {id = kind, label = kind, kind = kind, command = "echo " .. kind} end
+    p:receive(s); p:render(36, 40)
+    for _, kind in ipairs({"dev", "build", "test", "check"}) do assert(action_y(p, "run-script", kind)) end
+    eq(action_y(p, "run-script", "task-12"), nil)
+    click(p, "toggle", "more-scripts"); click(p, "run-script", "task-12")
+    eq(#sent, 0); p:event("enter"); eq(sent[1].id, "task-12")
+end)
+test("Long command previews are scrollable in a narrow sidebar", function()
+    local p, sent = panel(); local s = snapshot()
+    s.project.scripts = {{id = "long", label = "long", command = string.rep("a", 200) .. "LAST_ARGUMENT"}}
+    p:receive(s); p:render(18, 8); p.focus = {"run-script", "long"}; p:move(0)
+    p:activate({"run-script", "long"}); p:render(18, 8)
+    for _ = 1, 5 do p:event("pagedown"); p:render(18, 8) end
+    contains(text(p:render(18, 8)), "LAST_ARGUMENT"); eq(#sent, 0)
+    p:event("escape"); eq(#sent, 0)
 end)
 test("Diff preview scrolls safely and requests its own close", function()
     local sent = {}; local preview = Preview.new(function(event) sent[#sent + 1] = event end)

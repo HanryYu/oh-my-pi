@@ -286,4 +286,19 @@ orphan.api.call("block.close", { block_id = osaved.panel })
 local recovery = Controller.new(orphan.api, function() end, "/module", 404)
 recovery:event { type = "source", root = "/private/root", source = clone(orphan.source), layout = osaved }
 check(not orphan.locate(osaved.detail) and orphan.locate("main"), "restart retires orphaned details without touching the conversation")
+local terminal = fixture(false)
+terminal.update()
+terminal.request("open-terminal")
+local terminal_id = terminal.state().project_terminal
+local terminal_window = terminal.locate(terminal_id)
+check(terminal_id and terminal_window and terminal_window.window_id == terminal.client.window_id,
+  "project terminal opens in the owning app's selected tab")
+local window_count = #terminal.view.windows
+terminal.request("open-terminal")
+check(terminal.state().project_terminal == terminal_id and #terminal.view.windows == window_count,
+  "opening the project terminal again reuses its live tab")
+terminal.request("hide")
+check(terminal.locate(terminal_id) and terminal.locate("main"), "hiding the observer preserves the project terminal and conversation")
+terminal.c:gone("/private/root")
+check(terminal.locate(terminal_id), "retiring the conversation does not close its independent terminal")
 print("Lua controller behavior checks passed")

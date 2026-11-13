@@ -77,17 +77,34 @@ function Controller:sync_label(state)
   state.window_label = label
 end
 
-function Controller:foreground(state, owner)
-  self:call("session.focus_block", { session_id = state.source.session, block_id = state.source.anchor })
+function Controller:foreground(state, owner, window, block)
+  window, block = window or state.window, block or state.source.anchor
+  self:call("session.focus_block", { session_id = state.source.session, block_id = block })
   if not owner then return end
   local client, err = self.api.call("client.inspect", { client_id = owner })
   if client and client.client and client.client.info and client.client.info.kind == "app" then
     local _, switch_err = self.api.call("client.perform", { client_id = owner, action = "session.select",
-      session_id = state.source.session, block_id = state.source.anchor, timeout_ms = 1500,
-      args = { session_id = state.source.session, window_id = state.window } })
+      session_id = state.source.session, block_id = block, timeout_ms = 1500,
+      args = { session_id = state.source.session, window_id = window } })
     err = switch_err
   end
   if err then self:notice(state, "Cannot switch to workspace: " .. tostring(err), true) end
+end
+
+function Controller:open_terminal(state)
+  if state.hidden or not state.panel then error("The workspace panel is closed", 0) end
+  local view, anchor = self:valid_anchor(state)
+  local window = state.project_terminal and window_of(view, state.project_terminal)
+  if not window then
+    local created = self:call("session.new_window", { session_id = state.source.session,
+      window_label = ui.clip(window_label(state), 52) .. " · Terminal", focus = false,
+      layout = self.api.layout.block { flavor = terminal .. ".shell", label = "Terminal",
+        options = { cwd = state.source.main.cwd } } })
+    state.project_terminal, window = created.block_ids[1], { window_id = created.window_id }
+    self:disown(state, state.project_terminal)
+  end
+  self:foreground(state, anchor_owner(anchor, state.source.anchor), window.window_id, state.project_terminal)
+  self:publish(state)
 end
 
 function Controller:log(message)
@@ -116,6 +133,7 @@ function Controller:publish(state)
     taskId = source.taskId,
     preview = state.preview, previewLayer = state.preview_layer, window = state.window,
     windowLabel = state.window_label, customLabel = state.custom_label,
+    terminal = state.project_terminal,
     selected = state.selected, requestSeq = state.request_seq, hidden = state.hidden,
     sidebarPercent = state.width })
   self:write(state, "view.json", { v = 1, root = state.root, main = source.main,
@@ -226,6 +244,7 @@ function Controller:adopt(state, saved)
   state.validated = true
   state.request_seq = tonumber(saved.requestSeq) or -1
   state.window_label, state.custom_label = saved.windowLabel, saved.customLabel == true
+  state.project_terminal = saved.terminal and window_of(view, saved.terminal) and saved.terminal or nil
   state.hidden = saved.hidden == true
   if saved.panel and window_of(view, saved.panel) == owner then
     state.panel, state.window = saved.panel, owner.window_id
@@ -408,6 +427,7 @@ function Controller:request(event)
     elseif kind == "show" then self:show(state)
     elseif kind == "hide" then self:hide(state)
     elseif kind == "select" then self:select(state, request.key)
+    elseif kind == "open-terminal" then self:open_terminal(state)
     elseif kind == "diff" or kind == "commit" or kind == "run-script" or kind == "add-script" or
         kind == "open-editor" or kind == "open-url" then
       if state.hidden or not state.panel then error("The workspace panel is closed", 0) end
@@ -450,6 +470,7 @@ function Controller:block_closed(session, id)
         -- Keep hidden until a newer explicit bridge show request arrives.
         state.panel = nil; self:hide(state)
       elseif id == state.detail then state.detail, state.selected = nil, nil; self:publish(state)
+      elseif id == state.project_terminal then state.project_terminal = nil; self:publish(state)
       elseif id == state.preview then
         state.preview, state.preview_layer = nil, nil
         self:publish(state)
