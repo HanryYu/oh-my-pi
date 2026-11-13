@@ -35,14 +35,15 @@ test("native request ownership, worker evidence, park/removal and fail-closed ev
 	const saved = { REX_BLOCK: process.env.REX_BLOCK, REX_SESSION: process.env.REX_SESSION,
 		REX_SUBAGENT_VIEWER: process.env.REX_SUBAGENT_VIEWER, REX_WORKSPACE_WIDTH: process.env.REX_WORKSPACE_WIDTH,
 		REX_WORKSPACE_SCAN_DIR: process.env.REX_WORKSPACE_SCAN_DIR, REX_WORKSPACE_OMP: process.env.REX_WORKSPACE_OMP };
-	delete process.env.REX_WORKSPACE_SCAN_DIR;
+	const scan = fs.mkdtempSync("/tmp/rex-bridge-request-");
+	process.env.REX_WORKSPACE_SCAN_DIR = scan;
 	delete process.env.REX_WORKSPACE_OMP;
 	process.env.REX_BLOCK = `bridge-smoke-${crypto.randomUUID()}`;
 	process.env.REX_SESSION = "bridge-smoke";
 	process.env.REX_SUBAGENT_VIEWER = "1";
 	process.env.REX_WORKSPACE_WIDTH = "25";
 	const hash = crypto.createHash("sha256").update(process.env.REX_BLOCK).digest("hex").slice(0, 10);
-	const directory = path.join("/tmp", `rsv-${process.getuid?.()}-${process.pid}-${hash}`);
+	const directory = path.join(scan, `rsv-${process.getuid?.()}-${process.pid}-${hash}`);
 
 	const refs = new Map<string, Ref>();
 	const listeners = new Set<(event: RegistryEvent) => void>();
@@ -229,7 +230,7 @@ test("native request ownership, worker evidence, park/removal and fail-closed ev
 		streaming?.emit("session_shutdown");
 		unowned?.emit("session_shutdown");
 		main.emit("session_shutdown");
-		fs.rmSync(directory, { recursive: true, force: true });
+		fs.rmSync(scan, { recursive: true, force: true });
 		for (const [name, value] of Object.entries(saved)) {
 			if (value === undefined) delete process.env[name]; else process.env[name] = value;
 		}

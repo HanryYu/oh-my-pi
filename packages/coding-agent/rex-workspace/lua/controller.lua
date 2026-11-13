@@ -34,7 +34,8 @@ local function window_label(state)
   local main = state.source.main
   local label = type(main.title) == "string" and main.title:match("^%s*(.-)%s*$") or ""
   if label == "" then label = main.cwd:match("([^/]+)/?$") or "OMP" end
-  return ui.clip(ui.sanitize(label:sub(1, 128), true), 64)
+  label = ui.clip(ui.sanitize(label:sub(1, 128), true), 64):match("^%s*(.-)%s*$")
+  return label ~= "" and label or "OMP"
 end
 
 local function anchor_owner(window, anchor)

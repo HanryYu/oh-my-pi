@@ -62,7 +62,7 @@ local function fixture(with_neighbor)
     if method == "session.view" then return clone(view) end
     if method == "session.set_window_label" then
       for _, w in ipairs(view.windows) do
-        if w.window_id == args.window_id then w.label = args.label; return {} end
+        if w.window_id == args.window_id then w.label = args.label:match("^%s*(.-)%s*$"); return {} end
       end
       error("missing label target")
     end
@@ -229,6 +229,15 @@ refused.update()
 check(refused.state().panel and refused.locate("main") and refused.state().notice_error
   and refused.client.window_id == "work", "denied client control is reported without destroying the workspace")
 refused.c:shutdown()
+
+local trimmed = fixture(false)
+trimmed.source.main.title = string.rep("abcdefg ", 9)
+trimmed.update()
+trimmed.source.main.title = "A newer native title"
+trimmed.update()
+check(trimmed.view.windows[1].label == "A newer native title",
+  "server whitespace trimming is not mistaken for a manual rename")
+trimmed.c:shutdown()
 
 local manual_restart = fixture(false)
 manual_restart.update()
