@@ -379,6 +379,7 @@ def frozen_dependencies(runtime, bun):
     with tempfile.TemporaryDirectory(prefix="rex-validate-", dir="/tmp") as temporary:
         home = Path(temporary)
         environment = validation_environment(runtime, home)
+        environment["BUN_INSTALL_CACHE_DIR"] = str(private_directory(runtime.parent.parent / "dependency-cache"))
         # No scripts: prebuilt native installation is explicit and version checked.
         run([bun, "install", "--frozen-lockfile", "--ignore-scripts"], cwd=source, env=environment, timeout=1800)
 
