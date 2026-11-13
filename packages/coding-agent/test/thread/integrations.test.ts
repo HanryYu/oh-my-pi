@@ -19,6 +19,7 @@ import {
 	integrationsThreadService,
 	toWorkerCustomTool,
 } from "../../src/thread/services/integrations";
+import { runtimeThreadService } from "../../src/thread/services/runtime";
 import { settingsThreadService } from "../../src/thread/services/settings";
 import type { IntegrationsProbe } from "../fixtures/integrations-worker";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -76,7 +77,7 @@ describe("integrations thread service", () => {
 		MCPManager.setInstance(manager);
 		fixture = await startServiceWorker<IntegrationsProbe>(
 			new URL("../fixtures/integrations-worker.ts", import.meta.url),
-			[settingsThreadService, authService, integrationsThreadService],
+			[runtimeThreadService, settingsThreadService, authService, integrationsThreadService],
 		);
 		probe = fixture.probe;
 	});

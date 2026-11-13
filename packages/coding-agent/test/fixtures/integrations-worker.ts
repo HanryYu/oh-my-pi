@@ -14,6 +14,7 @@ import { type RpcFrame, RpcLink } from "../../src/thread/rpc";
 import { authService } from "../../src/thread/services/auth";
 import { integrationsThreadService } from "../../src/thread/services/integrations";
 import { RemoteMCPManager } from "../../src/thread/services/mcp-remote";
+import { runtimeThreadService } from "../../src/thread/services/runtime";
 import { settingsThreadService } from "../../src/thread/services/settings";
 
 /** Outcome of one tool call made from the worker. */
@@ -218,7 +219,7 @@ port.once("message", (init: { sync: MessagePort; counter: SharedArrayBuffer }) =
 		},
 		{ name: "integrations-fixture", sync: { port: init.sync, counter: new Int32Array(init.counter) } },
 	);
-	const services = [settingsThreadService, authService, integrationsThreadService];
+	const services = [runtimeThreadService, settingsThreadService, authService, integrationsThreadService];
 	for (const service of services) service.installWorker?.(link);
 	link.handle("ping", nonce => nonce);
 	link.handle("boot", async globals => {
