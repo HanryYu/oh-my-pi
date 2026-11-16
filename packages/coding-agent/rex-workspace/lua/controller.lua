@@ -134,6 +134,7 @@ function Controller:publish(state)
     preview = state.preview, previewLayer = state.preview_layer, window = state.window,
     windowLabel = state.window_label, customLabel = state.custom_label,
     terminal = state.project_terminal,
+    widthOverride = state.width_override,
     selected = state.selected, requestSeq = state.request_seq, hidden = state.hidden,
     sidebarPercent = state.width })
   self:write(state, "view.json", { v = 1, root = state.root, main = source.main,
@@ -245,6 +246,8 @@ function Controller:adopt(state, saved)
   state.request_seq = tonumber(saved.requestSeq) or -1
   state.window_label, state.custom_label = saved.windowLabel, saved.customLabel == true
   state.project_terminal = saved.terminal and window_of(view, saved.terminal) and saved.terminal or nil
+  local width = tonumber(saved.widthOverride)
+  if width and width % 1 == 0 and width >= 15 and width <= 35 then state.width_override = width end
   state.hidden = saved.hidden == true
   if saved.panel and window_of(view, saved.panel) == owner then
     state.panel, state.window = saved.panel, owner.window_id
@@ -273,11 +276,23 @@ function Controller:adopt(state, saved)
   return true
 end
 
+function Controller:apply_width(state)
+  local view, window = self:valid_anchor(state)
+  if not state.panel or window_of(view, state.panel) ~= window then
+    error("The workspace panel is not beside its conversation", 0)
+  end
+  self:call("session.resize_pane", { session_id = state.source.session,
+    direction = "horizontal", before_block_id = state.source.anchor,
+    after_block_id = state.panel, ratio = 1 - state.width / 100 })
+  state.width_applied = state.width
+end
+
 function Controller:show(state)
   local view, window = self:valid_anchor(state)
   state.validated = true
   if state.panel and window_of(view, state.panel) then
     state.hidden = false
+    self:apply_width(state)
     self:observe(state)
     self:publish(state)
     return
@@ -313,6 +328,7 @@ function Controller:show(state)
   end
   state.hidden = false
   self:disown(state, state.panel)
+  self:apply_width(state)
   self:observe(state)
   self:sync_label(state)
   if moved then self:foreground(state, owner) end
@@ -363,7 +379,7 @@ function Controller:source(event)
   local state = self.roots[event.root]
   if not state then
     state = { root = event.root, source = source, hidden = true, request_seq = -1,
-      width = 25, project = {}, retry_at = 0 }
+      width = 20, project = {}, retry_at = 0 }
     self.roots[event.root] = state
     if event.layout then
       local ok, err = pcall(self.adopt, self, state, event.layout)
@@ -392,7 +408,7 @@ function Controller:source(event)
     self:notice(state, "Sidebar width must be an integer from 15 to 35", true)
     return
   end
-  state.width = width
+  state.width = state.width_override or width
   if source.closed then self:gone(event.root); return end
   if state.selected and not agent_of(state, state.selected) then self:close_detail(state) end
   local sequence = tonumber(display.seq) or 0
@@ -407,6 +423,10 @@ function Controller:source(event)
     self:observe(state)
   end
   if state.panel and not state.hidden then
+    if state.width_applied ~= state.width then
+      local ok, err = pcall(self.apply_width, self, state)
+      if not ok then self:notice(state, err, true) end
+    end
     local ok, err = pcall(self.sync_label, self, state)
     if not ok then self:notice(state, err, true) end
   end
@@ -426,6 +446,14 @@ function Controller:request(event)
     elseif view ~= "panel" then error("This view is read-only", 0)
     elseif kind == "show" then self:show(state)
     elseif kind == "hide" then self:hide(state)
+    elseif kind == "set-width" then
+      local width = request.width
+      if type(width) ~= "number" or width % 1 ~= 0 or width < 15 or width > 35 then
+        error("Sidebar width must be an integer from 15 to 35", 0)
+      end
+      state.width_override, state.width = width, width
+      if state.panel and not state.hidden then self:apply_width(state) end
+      self:publish(state)
     elseif kind == "select" then self:select(state, request.key)
     elseif kind == "open-terminal" then self:open_terminal(state)
     elseif kind == "diff" or kind == "commit" or kind == "run-script" or kind == "add-script" or

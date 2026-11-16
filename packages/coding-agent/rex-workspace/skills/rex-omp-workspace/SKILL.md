@@ -9,7 +9,7 @@ Read `skill://rex` first and follow its installed-CLI guidance. Use that skill f
 
 ## Keep the native workspace
 
-Lua owns layout and interaction. The left pane stays the native OMP conversation. The right sidebar defaults to 25% of the tab and shows project information and agents belonging to the current user task. The lower-right agent detail uses the native read-only OMP renderer, not a second conversation or a log imitation.
+Lua owns layout and interaction. The left pane stays the native OMP conversation. The right sidebar defaults to 20% of the tab and shows project information and agents belonging to the current user task. The lower-right agent detail uses the native read-only OMP renderer, not a second conversation or a log imitation.
 
 Workspace tab selection changes the owning Rex client's selected tab only. Do not activate the macOS application, broadcast selection to other clients, or change Remote Control permissions. Show client errors instead of bypassing them.
 
@@ -88,6 +88,8 @@ printf '%s\n' '{"type":"open-terminal"}' |
 ```
 
 For a detected GUI editor, use `{"type":"open-editor"}` through the same request interface. A project terminal is reused and selected inside Rex; hiding the sidebar does not close it.
+
+To set the sidebar width on an existing conversation, send `{"type":"set-width","width":20}` through the same request interface. Width is an integer percentage from 15 to 35. This saves a workspace override, applies the actual Rex split, and survives observer restart without restarting the conversation or its agents. Ordinary status updates do not undo manual border dragging; an explicit show restores the configured width.
 
 Read the response and report failures. After a timeout, inspect existing state before retrying so a successful first request does not create duplicate terminals or services. A launch acknowledgement alone does not prove that a server is ready or a build passed. Verify only when the task calls for it, using the returned target and the installed Rex CLI guidance.
 

@@ -19,6 +19,7 @@
 - Validated updates share a private dependency cache instead of downloading unchanged packages for every candidate.
 - New Rex workspace tabs open in the conversation's owning app with input focused on the conversation.
 - Rex workspace tabs follow native session titles, use the project name before a title exists, and preserve subsequent manual renames.
+- Rex workspaces default to an 80/20 split, reapply configured widths when restoring existing panels, and can save width changes for running conversations without restarting them.
 
 ## [18.20.0] - 2026-11-12
 

@@ -41,7 +41,7 @@ test("native request ownership, worker evidence, park/removal and fail-closed ev
 	process.env.REX_BLOCK = `bridge-smoke-${crypto.randomUUID()}`;
 	process.env.REX_SESSION = "bridge-smoke";
 	process.env.REX_SUBAGENT_VIEWER = "1";
-	process.env.REX_WORKSPACE_WIDTH = "25";
+	delete process.env.REX_WORKSPACE_WIDTH;
 	const hash = crypto.createHash("sha256").update(process.env.REX_BLOCK).digest("hex").slice(0, 10);
 	const directory = path.join(scan, `rsv-${process.getuid?.()}-${process.pid}-${hash}`);
 

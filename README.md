@@ -11,7 +11,7 @@ python3 scripts/rex.py install
 rex-omp
 ```
 
-Run `rex-omp` in Rex. Start a new session after installing; existing conversations are not restarted. The default right side is 25%, configurable with `REX_WORKSPACE_WIDTH=15..35`. Selecting a subagent opens one lower-right pane; switching agents reuses it. A new user task clears historical agents, and removing the selected agent closes its pane.
+Run `rex-omp` in Rex. Start a new session after installing; existing conversations are not restarted. The default split is 80% conversation and 20% sidebar, configurable with `REX_WORKSPACE_WIDTH=15..35`. Selecting a subagent opens one lower-right pane; switching agents reuses it. A new user task clears historical agents, and removing the selected agent closes its pane.
 
 The sidebar exposes a detected GUI editor, a reusable project terminal, Git changes, current-task subagents, scripts and listening servers. Common development/build/test/check commands stay visible; additional scripts expand in place. Select a script to inspect its command and working directory, then press Enter to run. Running scripts show their observed process state and log path; hiding the observer does not stop them or close the project terminal.
 

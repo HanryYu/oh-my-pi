@@ -76,6 +76,22 @@ local function fixture(with_neighbor)
       client.window_id = args.args.window_id
       return { performed_by = args.client_id }
     end
+    if method == "session.resize_pane" then
+      local w, layer = locate(args.before_block_id)
+      local other, other_layer = locate(args.after_block_id)
+      assert(w and w == other and layer == other_layer, "resize cannot cross windows or layers")
+      local function resize(node)
+        local split = node and node.split
+        if not split then return false end
+        if split.direction == args.direction and has(split.before, args.before_block_id) and has(split.after, args.after_block_id) then
+          split.ratio = args.ratio
+          return true
+        end
+        return resize(split.before) or resize(split.after)
+      end
+      assert(resize(layer.layout), "missing border")
+      return {}
+    end
     if method == "session.new_split" then
       local w, l = locate(args.anchor_id); assert(w, "missing anchor")
       local id = next_id(); l.layout = insert(l.layout, args.anchor_id, block(id), args)
@@ -286,6 +302,52 @@ orphan.api.call("block.close", { block_id = osaved.panel })
 local recovery = Controller.new(orphan.api, function() end, "/module", 404)
 recovery:event { type = "source", root = "/private/root", source = clone(orphan.source), layout = osaved }
 check(not orphan.locate(osaved.detail) and orphan.locate("main"), "restart retires orphaned details without touching the conversation")
+for _, neighbor in ipairs { false, true } do
+  local proportional = fixture(neighbor)
+  proportional.source.display.width = 20
+  proportional.update()
+  local window = proportional.locate("main")
+  check(window.layers[1].layout.split.ratio == 0.8,
+    "the requested 80/20 split applies to both reused and newly created workspace tabs")
+  proportional.source.display.width = 35
+  proportional.update()
+  check(window.layers[1].layout.split.ratio == 0.65,
+    "changing configured width resizes an existing workspace without replacing panes")
+  proportional.c:shutdown()
+end
+
+local width_restart = fixture(false)
+width_restart.update()
+width_restart.request("select", "A:1")
+width_restart.c:event { type = "request", root = "/private/root", view = "panel",
+  request = { type = "set-width", width = 20 } }
+local width_window = width_restart.locate("main")
+check(width_window.layers[1].layout.split.ratio == 0.8,
+  "a running conversation can change width without restarting its agents")
+local width_saved
+for _, message in ipairs(width_restart.messages) do
+  if message.type == "publish" and message.name == "workspace.json" then width_saved = clone(message.data) end
+end
+width_window.layers[1].layout.split.ratio = 0.5
+local width_recovered = Controller.new(width_restart.api, function() end, "/module", 606)
+width_recovered:event { type = "source", root = "/private/root",
+  source = clone(width_restart.source), layout = width_saved }
+local width_after = width_recovered.roots["/private/root"]
+check(width_window.layers[1].layout.split.ratio == 0.8 and width_after.panel == width_saved.panel
+  and width_after.detail == width_saved.detail,
+  "restart corrects a restored 50/50 layout while preserving the live panel and agent detail")
+width_window.layers[1].layout.split.ratio = 0.7
+width_recovered:event { type = "source", root = "/private/root", source = clone(width_restart.source) }
+check(width_window.layers[1].layout.split.ratio == 0.7,
+  "ordinary status updates do not fight a subsequent manual border drag")
+width_recovered:request { root = "/private/root", view = "panel", request = { type = "show" } }
+check(width_window.layers[1].layout.split.ratio == 0.8,
+  "explicit show reapplies the saved width rather than keeping an old even split")
+width_recovered:request { root = "/private/root", view = "panel", request = { type = "set-width", width = 12 } }
+check(width_window.layers[1].layout.split.ratio == 0.8 and width_after.notice_error,
+  "invalid widths cannot alter the current split")
+width_recovered:shutdown()
+
 local terminal = fixture(false)
 terminal.update()
 terminal.request("open-terminal")

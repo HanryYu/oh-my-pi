@@ -35,7 +35,7 @@ function canonical(value: string | null | undefined): string | undefined {
 }
 function key(ref: AgentRef): string { return `${ref.id}:${ref.generation}`; }
 function sidebarWidth(): number | undefined {
-	const raw = process.env.REX_WORKSPACE_WIDTH || "25";
+	const raw = process.env.REX_WORKSPACE_WIDTH || "20";
 	const width = /^\d+$/.test(raw) ? Number(raw) : NaN;
 	return Number.isInteger(width) && width >= 15 && width <= 35 ? width : undefined;
 }
