@@ -17,6 +17,8 @@ rex-omp
 
 命令从 package scripts 和 lockfile、受支持的 `.claude/launch.json` 进程定义、Make target 及无必填参数的 Just recipe 中静态发现，不执行项目命令。内置 [`rex-omp-workspace` skill](packages/coding-agent/rex-workspace/skills/rex-omp-workspace/SKILL.md) 指导 agent 复用已有命令，并通过私有 CLI 登记经项目配置确认的缺失工作流。发现和保存不会启动服务；不冒充 Claude Desktop 的内嵌浏览器、自动验证或 `autoPort`。
 
+项目及 package 根目录、`scripts/`、`script/`、`bin/`、`tools/` 内的已有脚本也会在限定深度内静态发现，随文件新增、删除自动同步，内容改变后旧执行 ID 失效。已有配置直接调用同一脚本时，优先保留配置入口，避免重复。执行前需检查参数和工作目录要求；超出自动发现范围或需要参数的脚本，由 skill 指导登记完整调用命令。
+
 安装需要 macOS、Python 3.9+、Git、Rex 和 `lsof`。安装器准备私有 Bun 与匹配的官方 native binding，不替换 Homebrew 的 `omp`、升级全局 Bun 或修改账号、输入框、主题及全局 OMP 设置。fork 加载扩展时会排除已退役的 `rex-subagent-viewer`，但保留其文件给官方版及配置同步的其他机器使用。
 
 ## 更新与回退

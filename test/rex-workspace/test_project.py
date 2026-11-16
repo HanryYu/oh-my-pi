@@ -180,6 +180,107 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(scripts["service"]["cwd"], str(nested))
         self.assertNotIn("DO_NOT_EXPOSE_ENV_SECRET", json.dumps(snapshot))
 
+    def test_directory_scripts_sync_without_execution_and_reject_edited_or_deleted_files(self):
+        directory = self.repo / "scripts"
+        directory.mkdir()
+        path = directory / "build app.sh"
+        path.write_text('#!/bin/bash\n[[ -d scripts ]] || exit 7\nprintf "%s" "$PWD" > compile-proof\n')
+        with mock.patch.object(project.subprocess, "run") as run, mock.patch.object(project.subprocess, "Popen") as launch:
+            snapshot = self.state.script_snapshot()
+            run.assert_not_called()
+            launch.assert_not_called()
+        self.assertFalse((self.repo / "compile-proof").exists())
+        self.assertFalse(self.state.config.exists())
+        script = snapshot["scripts"][0]
+        self.assertEqual(script["label"], "scripts/build app.sh")
+        self.assertEqual(script["kind"], "build")
+        self.state.run_script(script["id"])
+        self.state._children[-1].wait(timeout=5)
+        self.assertEqual((self.repo / "compile-proof").read_text(), str(self.repo))
+        path.write_text("#!/bin/bash\nprintf changed > should-not-run\n")
+        with mock.patch.object(project.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(project.ProjectError, "已变化"):
+                self.state.run_script(script["id"])
+            launch.assert_not_called()
+        updated = self.state.script_snapshot()["scripts"][0]
+        self.assertNotEqual(updated["id"], script["id"])
+        self.assertFalse((self.repo / "should-not-run").exists())
+        path.unlink()
+        self.assertEqual(self.state.script_snapshot()["scripts"], [])
+        (self.repo / "compile.sh").write_text("printf new\n")
+        self.assertEqual([row["label"] for row in self.state.script_snapshot()["scripts"]], ["compile.sh"])
+
+    def test_directory_scripts_preserve_shebang_flags_and_extensionless_executables(self):
+        directory = self.repo / "tools"
+        directory.mkdir()
+        (directory / "build.py").write_text(
+            "#!/usr/bin/env -S python3 -u\nimport sys\nfrom pathlib import Path\n"
+            "Path('flags-proof').write_text(str(sys.stdout.write_through))\n")
+        executable = directory / "compile-native"
+        executable.write_text("#!/bin/sh\nprintf native > native-proof\n")
+        executable.chmod(0o700)
+        for script in self.state.script_snapshot()["scripts"]:
+            self.state.run_script(script["id"])
+            self.assertEqual(self.state._children[-1].wait(timeout=5), 0)
+        self.assertEqual((self.repo / "flags-proof").read_text(), "True")
+        self.assertEqual((self.repo / "native-proof").read_text(), "native")
+
+    def test_directory_discovery_stays_in_project_scope_and_ignores_dependency_and_symlink_trees(self):
+        self.repository()
+        root_scripts = self.repo / "scripts"
+        root_scripts.mkdir()
+        (root_scripts / "build.sh").write_text("true\n")
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "compile.sh").write_bytes(b"#!/bin/sh\n\xff")
+        (root_scripts / "linked.sh").symlink_to(outside / "compile.sh")
+        (self.repo / "tools").symlink_to(outside, target_is_directory=True)
+        for name in ("node_modules", ".hidden", "one/two/three"):
+            hidden = root_scripts / name
+            hidden.mkdir(parents=True)
+            (hidden / "build.sh").write_text("true\n")
+        app = self.repo / "packages" / "app"
+        (app / "src").mkdir(parents=True)
+        (app / "package.json").write_text('{"scripts":{}}')
+        (app / "scripts").mkdir()
+        (app / "scripts" / "compile.sh").write_text("true\n")
+        sibling = self.repo / "packages" / "other" / "scripts"
+        sibling.mkdir(parents=True)
+        (sibling / "build.sh").write_text("true\n")
+        nested = project.ProjectState(str(app / "src"), os.getpid(), self.base / "nested-state")
+        self.addCleanup(nested.close)
+        snapshot = nested.script_snapshot()
+        self.assertEqual(snapshot["errors"], [])
+        self.assertEqual({row["label"] for row in snapshot["scripts"]},
+                         {"scripts/build.sh", "packages/app/scripts/compile.sh"})
+
+    def test_configured_wrappers_prevent_duplicate_file_entries_but_reading_a_file_does_not(self):
+        directory = self.repo / "scripts"
+        directory.mkdir()
+        (directory / "build app.sh").write_text("true\n")
+        (directory / "check.py").write_text("pass\n")
+        config = self.repo / "package.json"
+        config.write_text(json.dumps({"scripts": {
+            "build": "bash 'scripts/build app.sh' --mode release",
+            "inspect": "cat scripts/check.py"}}))
+        self.assertEqual({row["label"] for row in self.state.script_snapshot()["scripts"]},
+                         {"build", "inspect", "scripts/check.py"})
+        config.write_text('{"scripts":{}}')
+        self.assertEqual({row["label"] for row in self.state.script_snapshot()["scripts"]},
+                         {"scripts/build app.sh", "scripts/check.py"})
+        self.state.add_script("Build with arguments", "bash 'scripts/build app.sh' --mode debug")
+        self.assertEqual({row["label"] for row in self.state.script_snapshot()["scripts"]},
+                         {"Build with arguments", "scripts/check.py"})
+
+    def test_directory_scan_limit_is_reported_without_hiding_declared_commands(self):
+        (self.repo / "package.json").write_text('{"scripts":{"build":"echo configured"}}')
+        for name in ("build.sh", "compile.sh", "check.sh"):
+            (self.repo / name).write_text("true\n")
+        with mock.patch.object(self.state, "SCRIPT_SCAN_LIMIT", 2):
+            snapshot = self.state.script_snapshot()
+        self.assertIn("build", {row["label"] for row in snapshot["scripts"]})
+        self.assertTrue(any("扫描达到" in error for error in snapshot["errors"]))
+
     def test_discovery_reads_taskfiles_without_evaluating_repository_code(self):
         marker = self.repo / "should-not-exist"
         (self.repo / "Makefile").write_text(

@@ -17,6 +17,8 @@ The sidebar exposes a detected GUI editor, a reusable project terminal, Git chan
 
 Commands are discovered without execution from package scripts and lockfiles, supported process definitions in `.claude/launch.json`, Make targets and parameter-free Just recipes. The bundled [`rex-omp-workspace` skill](packages/coding-agent/rex-workspace/skills/rex-omp-workspace/SKILL.md) teaches the agent to reuse these commands and save verified missing workflows through a private CLI. Discovery and saving never start services. This does not implement Claude Desktop's embedded browser, automatic verification or `autoPort`.
 
+Existing scripts in the project/package root and `scripts/`, `script/`, `bin/`, or `tools/` are also discovered statically within bounded depth. Entries follow file additions/removals; edits invalidate pending execution IDs. Configured direct wrappers take precedence over duplicate raw-file entries. Inspect required arguments and working-directory assumptions before running a file; the workspace skill explains how to register complete custom invocations.
+
 The installer needs macOS, Python 3.9+, Git, Rex and `lsof`. It prepares a compatible private Bun and matching official native bindings. It does not replace Homebrew's `omp`, upgrade the global Bun, or change accounts, the composer, themes or global OMP settings. The fork skips the retired `rex-subagent-viewer` extension when loading extensions. Its files remain available to official OMP and configuration-sync peers.
 
 ## Update and recovery

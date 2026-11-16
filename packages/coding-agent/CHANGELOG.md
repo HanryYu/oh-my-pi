@@ -9,6 +9,7 @@
 - The fork's `rex-omp` installer supports validated official-release updates and rollback without replacing the official OMP installation.
 - The narrow Rex sidebar exposes detected GUI editors, a reusable project terminal, visible project scripts and actual script-process states. Launching a script requires command confirmation.
 - Project commands are discovered without execution from package scripts, supported Claude launch configurations, Make targets and parameter-free Just recipes. The bundled `rex-omp-workspace` skill can register verified private commands without starting them.
+- Existing project script files appear automatically in Rex Scripts, follow file additions/removals, and defer to configured wrappers instead of duplicating them.
 
 ### Fixed
 

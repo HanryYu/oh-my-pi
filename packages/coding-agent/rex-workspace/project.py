@@ -89,6 +89,7 @@ class ProjectState:
     COMMAND_TIMEOUT = 4
     SUPERVISOR_INTERVAL = 15
     DIFF_LIMIT = 512 * 1024
+    SCRIPT_SCAN_LIMIT = 4096
 
     def __init__(self, cwd, omp_pid, state_dir, *, omp_executable="omp", command_path=None, agent_dir=None):
         self.cwd = os.path.realpath(cwd)
@@ -110,6 +111,7 @@ class ProjectState:
         self._script_failures = {}
         self._owned_pids = {}
         self._file_counts = {}
+        self._script_files = {}
         self._supervisor_at = None
         self._supervisor = []
         self._supervisor_error = None
@@ -310,6 +312,7 @@ class ProjectState:
 
     @staticmethod
     def _script_kind(name):
+        name = re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", name)
         words = set(re.split(r"[^a-z0-9]+", name.lower()))
         for kind, labels in (("dev", {"dev", "start", "serve", "watch"}),
                              ("build", {"build", "compile", "bundle"}),
@@ -500,6 +503,97 @@ class ProjectState:
             self._register_script(scripts, "just" if just else "make", name, shlex.join(argv),
                                   str(path.relative_to(self.root)), path.parent, argv, stamp)
 
+    def _directory_scripts(self, scripts, errors):
+        # Prefer configured wrappers, which may supply required flags or setup.
+        wrapped = set()
+        interpreters = {"sh", "bash", "zsh", "fish", "python", "python3", "node", "bun", "ruby", "perl", "deno", "tsx"}
+        for script in scripts.values():
+            try:
+                words = shlex.split(script["command"])
+            except ValueError:
+                continue
+            if not words:
+                continue
+            runner = Path(words[0]).name
+            if runner in interpreters or re.fullmatch(r"python3\.\d+", runner):
+                arguments = words[1:]
+                if any(word in ("-c", "-m", "-e", "--eval") for word in arguments):
+                    continue
+                if runner == "bun" and arguments[:1] == ["run"]:
+                    arguments = arguments[1:]
+                target = next((word for word in arguments if not word.startswith("-")), None)
+            else:
+                target = words[0] if "/" in words[0] else None
+            if target:
+                wrapped.add(os.path.realpath(Path(script["_cwd"]) / target))
+
+        roots = list(dict.fromkeys((self._package_directory() or Path(self.cwd), Path(self.root))))
+        pending = [(root, root, 0) for root in reversed(roots)]
+        directories, files, cache = set(), set(), {}
+        extensions = {".sh": "sh", ".command": "sh", ".py": "python3", ".rb": "ruby",
+                      ".pl": "perl", ".js": "node", ".mjs": "node", ".cjs": "node"}
+        ignored = {"node_modules", "vendor", "venv", "__pycache__", "dist", "out", "target"}
+        count = 0
+        try:
+            while pending:
+                directory, cwd, depth = pending.pop()
+                if directory in directories:
+                    continue
+                directories.add(directory)
+                with os.scandir(directory) as entries:
+                    children = []
+                    for entry in entries:
+                        count += 1
+                        if count > self.SCRIPT_SCAN_LIMIT:
+                            raise ProjectError("目录脚本扫描达到 %d 项上限；请用项目配置或私有命令登记其他脚本" % self.SCRIPT_SCAN_LIMIT)
+                        children.append(entry)
+                for entry in sorted(children, key=lambda item: item.name):
+                    path = Path(entry.path)
+                    if entry.name.startswith((".", "_")) or entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < 3 and entry.name not in ignored and (depth > 0 or entry.name in ("scripts", "script", "bin", "tools")):
+                            pending.append((path, cwd, depth + 1))
+                        continue
+                    if not entry.is_file(follow_symlinks=False) or path in files or not _within(path, self.root):
+                        continue
+                    files.add(path)
+                    if str(path) in wrapped:
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    executable = bool(info.st_mode & 0o111)
+                    extension = path.suffix.lower()
+                    if not executable and extension not in extensions and extension != ".ts":
+                        continue
+                    if depth == 0 and extension not in (".sh", ".command") and not executable and self._script_kind(path.stem) == "task":
+                        continue
+                    stamp = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode)
+                    try:
+                        saved = self._script_files.get(path)
+                        if saved and saved[0] == stamp:
+                            argv, content_id = saved[1:]
+                        else:
+                            with path.open("rb") as stream:
+                                shebang = stream.read(2) == b"#!"
+                            if not shebang and extension not in extensions:
+                                continue
+                            raw = self._read_text(path)
+                            if shebang:
+                                argv = [str(path)] if executable else shlex.split(raw.splitlines()[0][2:].strip()) + [str(path)]
+                                if len(argv) < 2 and not executable:
+                                    raise ProjectError("脚本解释器为空: " + str(path))
+                            else:
+                                argv = [extensions[extension], str(path)]
+                            content_id = _identity(raw)
+                        cache[path] = (stamp, argv, content_id)
+                        relative = str(path.relative_to(self.root))
+                        self._register_script(scripts, "file", relative, shlex.join(argv),
+                                              relative, cwd, argv, content_id)
+                    except (OSError, ValueError, ProjectError) as error:
+                        errors.append(_text("%s: %s" % (path, error)))
+        finally:
+            self._script_files = cache
+
     def _load_scripts(self):
         scripts, errors = {}, []
         for discover in (lambda: self._package_scripts(scripts),
@@ -515,6 +609,10 @@ class ProjectState:
                 name, command = item["name"], item["command"]
                 self._register_script(scripts, "user", name, command, "user", self.cwd,
                                       ["/bin/sh", "-c", command], command)
+        except (OSError, ProjectError) as error:
+            errors.append(_text(error))
+        try:
+            self._directory_scripts(scripts, errors)
         except (OSError, ProjectError) as error:
             errors.append(_text(error))
         return scripts, list(dict.fromkeys(errors))

@@ -19,9 +19,13 @@ The workspace observer does not need model calls. Do not add a model loop or rep
 
 ## Discover before configuring
 
-Project-script discovery reads existing `package.json` scripts and lockfiles, `.claude/launch.json`, `Makefile`, and `justfile`. Discovery must not execute repository commands, install dependencies, start services, or evaluate build files as a way to list commands.
+Project-script discovery reads existing `package.json` scripts and lockfiles, `.claude/launch.json`, `Makefile`, `justfile`, and script files at the project/package root and under `scripts/`, `script/`, `bin/`, and `tools/` (up to three directory levels). It skips symlinks, hidden/generated/dependency directories and reports scan limits. Root shell scripts, workflow-named scripts, executable scripts, and conventional script-directory entries are discovered without running them. TypeScript files need a declared shebang; do not choose a runner merely because it is installed. Discovery must not execute repository commands, install dependencies, start services, or evaluate build files as a way to list commands.
 
 When the user asks to set up a development workflow, first read the project's actual configuration, dependencies, and documentation. Check its package-manager choice and the tools available on the project host. Reuse discovered commands. Add missing editor, development/start, or build commands only when those sources establish how they should work. Do not guess that a project has `dev` or `build`, choose a package manager from habit, or claim that an editor is installed without checking.
+
+Before adding a script, inspect the project's existing build/start/compile scripts, their contents, argument parsing and references in README/build configuration. Reuse the actual file with its required flags and correct working directory instead of generating a second implementation or registering a guessed command. Prefer existing package/Make/Just/launch wrappers that supply setup or arguments. If a verified workflow is outside automatic discovery or needs parameters, register its complete invocation with `scripts ... add`. Never run a script or its `--help` option just to discover it.
+
+File discovery refreshes automatically: new scripts appear, removed scripts disappear, and content/interpreter changes invalidate old execution IDs. These entries are not copied into private configuration, so deleted files do not leave saved stale commands. A direct file entry does not establish that its arguments, credentials or interactive input are optional; inspect those requirements before choosing Run or saving a parameterized command.
 
 When a coding task adds or changes a reusable development/start/build workflow, refresh discovery and register any verified missing custom commands as part of that task. Do not make the user transcribe commands already established by the repository. Discovery and saving remain separate from execution.
 
