@@ -4,6 +4,27 @@ local unicode = dofile(dir .. "unicode.lua")
 local M = {unicode = unicode, MAX_LINE = 1024 * 1024}
 local colors = {muted = "\27[90m", accent = "\27[36m", selected = "\27[1;36m", error = "\27[31m", good = "\27[32m", heading = "\27[1m"}
 
+-- Select only the app that owns the source pane; never activate the OS app or
+-- broadcast to every attached client. A refusal is returned to the caller.
+function M.anchor_owner(window, anchor)
+    for _, layer in ipairs(window.layers or {}) do
+        for _, block in ipairs(layer.blocks or {}) do
+            if block.block_id == anchor then return block.owner end
+        end
+    end
+end
+function M.select_window(api, session, owner, window, block)
+    if not owner then return true end
+    local client, err = api.call("client.inspect", {client_id = owner})
+    if not client then return nil, err or "The source app is unavailable" end
+    if not (client.client and client.client.info and client.client.info.kind == "app") then return true end
+    local result, switch_err = api.call("client.perform", {client_id = owner, action = "session.select",
+        session_id = session, block_id = block, timeout_ms = 1500,
+        args = {session_id = session, window_id = window}})
+    if switch_err then return nil, switch_err end
+    return result or true
+end
+
 -- Rex's Lua VM has a bounded value stack. table.concat otherwise pushes every
 -- element at once, so a normal large diff can overflow that stack.
 function M.concat(parts, first, last)

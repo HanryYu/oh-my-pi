@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import sys
@@ -36,6 +37,15 @@ class UpdateTests(unittest.TestCase):
         self.config = self.base / "rex/init.lua"
         self.launcher = self.base / "bin/rex-omp"
         self.active = self.prefix / "active.json"
+        self.app = self.prefix / rex.LINK_APP
+        self.registration = mock.patch.object(rex, "register_link_app").start()
+        self.addCleanup(mock.patch.stopall)
+        original_run = rex.run
+        def without_codesign(argv, **kwargs):
+            if str(argv[0]) == "/usr/bin/codesign":
+                return ""
+            return original_run(argv, **kwargs)
+        mock.patch.object(rex, "run", side_effect=without_codesign).start()
         self.old_bridge = self.base / "agent/extensions/rex-subagent-viewer"
         self.old_bridge.mkdir(mode=0o700, parents=True)
         (self.old_bridge / "user-note").write_bytes(b"user's extension content\x00")
@@ -84,6 +94,10 @@ class UpdateTests(unittest.TestCase):
                     "fork": {"remote": str(self.fork), "branch": "rex"}, "bun": sys.executable,
                     "upstream": {"remote": str(self.upstream), "tag": "v1.0.0", "commit": self.base_commit},
                     "testFixture": label}
+        executable = runtime / "path-link-handler"
+        rex.write_bytes(executable, ("handler fixture " + label).encode(), 0o700)
+        metadata["pathLinkHandler"] = {"path": executable.name,
+                                      "sha256": rex.hashlib.sha256(executable.read_bytes()).hexdigest()}
         rex.json_write(runtime / "runtime.json", metadata)
         rex.write_bytes(runtime / "rex-omp", rex.launcher_bytes(self.prefix, runtime), 0o700)
         return runtime
@@ -94,7 +108,9 @@ class UpdateTests(unittest.TestCase):
         return old
 
     def snapshot(self):
-        return self.active.read_bytes(), self.config.read_bytes(), self.launcher.read_bytes()
+        app = tuple(sorted((str(path.relative_to(self.app)), path.read_bytes(), path.stat().st_mode)
+                           for path in self.app.rglob("*") if path.is_file())) if self.app.exists() else None
+        return self.active.read_bytes(), self.config.read_bytes(), self.launcher.read_bytes(), app
 
     def bump_upstream(self, conflicting=False):
         self.packages(self.upstream, "1.0.1")
@@ -301,6 +317,153 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaises(rex.RexError):
             rex.activate(self.prefix, new, self.locations, observer=False)
         self.assertEqual(self.snapshot(), original)
+
+    def test_swift_compile_failure_removes_candidate_before_activation(self):
+        self.install_old()
+        self.bump_upstream()
+        original = self.snapshot()
+        runtimes = set((self.prefix / "runtimes").iterdir())
+        with mock.patch.object(rex, "bun_runtime", return_value=sys.executable), \
+                mock.patch.object(rex, "compile_link_handler", side_effect=rex.RexError("Swift compiler failed")), \
+                mock.patch.object(rex, "frozen_dependencies") as dependencies:
+            with self.assertRaisesRegex(rex.RexError, "Swift compiler failed"):
+                self.update()
+        dependencies.assert_not_called()
+        self.assertEqual(self.snapshot(), original)
+        self.assertEqual(set((self.prefix / "runtimes").iterdir()), runtimes)
+
+    def test_compiler_checks_all_resources_and_requires_executable_output(self):
+        runtime = self.retained("compile")
+        (runtime / "path-link-handler").unlink()
+        with mock.patch.object(rex, "run", return_value="") as compiler:
+            with self.assertRaisesRegex(rex.RexError, "not produced"):
+                rex.compile_link_handler(runtime)
+        argv = compiler.call_args.args[0]
+        self.assertEqual(argv[:4], ["/usr/bin/xcrun", "swiftc", "-O", "-framework"])
+        self.assertEqual(argv[-2:], ["-o", runtime / "path-link-handler"])
+        (runtime / "source" / rex.RESOURCE / "path_opener.py").unlink()
+        with mock.patch.object(rex, "run") as compiler:
+            with self.assertRaisesRegex(rex.RexError, "resource is missing"):
+                rex.compile_link_handler(runtime)
+        compiler.assert_not_called()
+
+    def test_new_handler_integrity_failure_leaves_installation_untouched(self):
+        self.install_old()
+        original = self.snapshot()
+        new = self.retained("corrupted")
+        (new / "path-link-handler").write_bytes(b"changed")
+        with self.assertRaisesRegex(rex.RexError, "integrity"):
+            rex.activate(self.prefix, new, self.locations, observer=False)
+        self.assertEqual(self.snapshot(), original)
+
+    def test_bundle_uses_only_our_scheme_and_an_immutable_launcher(self):
+        runtime = self.install_old()
+        info = plistlib.loads((self.app / "Contents/Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleIdentifier"], rex.LINK_BUNDLE)
+        self.assertEqual(info["CFBundleURLTypes"], [{"CFBundleURLName": rex.LINK_BUNDLE,
+                                                    "CFBundleURLSchemes": ["rex-omp-file"]}])
+        self.assertTrue(info["LSUIElement"])
+        self.assertEqual(info["RexOMPLauncher"], str(runtime / "rex-omp"))
+        self.registration.assert_called_once_with(self.app)
+        module = Path(self.locations["rexDir"]) / rex.MODULE
+        for name in ("path_links.py", "path_opener.py"):
+            self.assertEqual((module / name).read_bytes(),
+                             (runtime / "source" / rex.RESOURCE / name).read_bytes())
+
+    def test_registration_failure_restores_prior_bundle_and_active_pointer(self):
+        self.install_old()
+        original = self.snapshot()
+        new = self.retained("registration")
+        self.registration.reset_mock()
+        self.registration.side_effect = [rex.RexError("registration failed"), None]
+        with self.assertRaisesRegex(rex.RexError, "registration failed"):
+            rex.activate(self.prefix, new, self.locations, observer=False)
+        self.assertEqual(self.snapshot(), original)
+        self.assertEqual(self.registration.call_args_list,
+                         [mock.call(self.app), mock.call(self.app, unregister=False)])
+
+    def test_first_registration_failure_removes_only_new_installation(self):
+        new = self.retained("first")
+        original = self.config.read_bytes()
+        self.registration.side_effect = [rex.RexError("registration failed"), None]
+        with self.assertRaisesRegex(rex.RexError, "registration failed"):
+            rex.activate(self.prefix, new, self.locations, observer=False)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.active.exists())
+        self.assertFalse(self.launcher.exists())
+        self.assertEqual(self.config.read_bytes(), original)
+        self.registration.assert_has_calls([mock.call(self.app), mock.call(self.app, unregister=True)])
+        self.assertEqual((self.old_bridge / "user-note").read_bytes(), b"user's extension content\x00")
+
+    def test_unrelated_bundle_is_never_replaced(self):
+        self.install_old()
+        info = self.app / "Contents/Info.plist"
+        info.write_bytes(plistlib.dumps({"CFBundleIdentifier": "unrelated.app"}))
+        original = self.snapshot()
+        with self.assertRaisesRegex(rex.RexError, "unrelated"):
+            rex.activate(self.prefix, self.retained("new"), self.locations, observer=False)
+        self.assertEqual(self.snapshot(), original)
+
+    def test_legacy_rollback_keeps_receiver_pinned_to_new_runtime(self):
+        legacy = self.retained("legacy")
+        metadata = rex.json_read(legacy / "runtime.json")
+        del metadata["pathLinkHandler"]
+        (legacy / "runtime.json").unlink()
+        rex.json_write(legacy / "runtime.json", metadata)
+        (legacy / "path-link-handler").unlink()
+        for name in ("path_links.py", "path_opener.py"):
+            (legacy / "source" / rex.RESOURCE / name).unlink()
+        rex.activate(self.prefix, legacy, self.locations, observer=False)
+        self.assertFalse(self.app.exists())
+        new = self.retained("new")
+        rex.activate(self.prefix, new, self.locations, observer=False)
+        info = (self.app / "Contents/Info.plist").read_bytes()
+        handler = (self.app / "Contents/MacOS/RexPathLinkHandler").read_bytes()
+        self.registration.reset_mock()
+        rex.activate(self.prefix, legacy, self.locations, observer=False)
+        self.assertEqual((self.app / "Contents/Info.plist").read_bytes(), info)
+        self.assertEqual((self.app / "Contents/MacOS/RexPathLinkHandler").read_bytes(), handler)
+        self.registration.assert_not_called()
+        with mock.patch.object(rex.os, "execve", side_effect=OSError("exec boundary")) as execute:
+            with self.assertRaises(OSError):
+                rex.entry([str(self.prefix), new.name, "open-link", "rex-omp-file://source/tmp/file"])
+        executable, argv, _ = execute.call_args.args
+        self.assertEqual(executable, sys.executable)
+        self.assertEqual(argv, [sys.executable, "-B", str(new / "source" / rex.RESOURCE / "path_links.py"),
+                                "--rex", self.locations["rexBinary"],
+                                "--url", "rex-omp-file://source/tmp/file"])
+
+    def test_entry_defaults_links_only_for_valid_rex_without_explicit_overrides(self):
+        runtime = self.install_old()
+        session = "11111111-2222-4333-8444-555555555555"
+        block = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        cases = [
+            ({"REX_SESSION": "session:" + session, "REX_BLOCK": "block:" + block},
+             {"PI_LINK_SCHEME": "rex-omp-file", "PI_LINK_HOST": session + "." + block.lower()}),
+            ({}, {}),
+            ({"REX_SESSION": "session:invalid", "REX_BLOCK": "block:" + block}, {}),
+            ({"REX_SESSION": "session:" + session}, {}),
+            ({"REX_SESSION": session, "REX_BLOCK": block, "PI_LINK_SCHEME": "custom"},
+             {"PI_LINK_SCHEME": "custom"}),
+            ({"REX_SESSION": session, "REX_BLOCK": block, "PI_LINK_HOST": ""},
+             {"PI_LINK_HOST": ""}),
+        ]
+        for values, expected in cases:
+            with self.subTest(values=values), mock.patch.dict(os.environ, values, clear=True):
+                with mock.patch.object(rex.os, "execve", side_effect=OSError("exec boundary")) as execute:
+                    with self.assertRaises(OSError):
+                        rex.entry([str(self.prefix), runtime.name, "--no-extensions"])
+                environment = execute.call_args.args[2]
+                self.assertEqual({key: value for key, value in environment.items()
+                                  if key in ("PI_LINK_SCHEME", "PI_LINK_HOST")}, expected)
+                self.assertEqual(dict(os.environ), values)
+
+    def test_open_link_rejects_extra_arguments_before_any_exec(self):
+        runtime = self.install_old()
+        with mock.patch.object(rex.os, "execve") as execute:
+            with self.assertRaisesRegex(rex.RexError, "Usage"):
+                rex.entry([str(self.prefix), runtime.name, "open-link", "url", "extra"])
+        execute.assert_not_called()
 
 
 if __name__ == "__main__":

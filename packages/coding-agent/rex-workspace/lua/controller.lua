@@ -38,13 +38,6 @@ local function window_label(state)
   return label ~= "" and label or "OMP"
 end
 
-local function anchor_owner(window, anchor)
-  for _, layer in ipairs(window.layers or {}) do
-    for _, block in ipairs(layer.blocks or {}) do
-      if block.block_id == anchor then return block.owner end
-    end
-  end
-end
 
 function Controller.new(api, send, module, worker_pid)
   return setmetatable({ api = api, send = send, module = module, worker_pid = worker_pid,
@@ -80,14 +73,7 @@ end
 function Controller:foreground(state, owner, window, block)
   window, block = window or state.window, block or state.source.anchor
   self:call("session.focus_block", { session_id = state.source.session, block_id = block })
-  if not owner then return end
-  local client, err = self.api.call("client.inspect", { client_id = owner })
-  if client and client.client and client.client.info and client.client.info.kind == "app" then
-    local _, switch_err = self.api.call("client.perform", { client_id = owner, action = "session.select",
-      session_id = state.source.session, block_id = block, timeout_ms = 1500,
-      args = { session_id = state.source.session, window_id = window } })
-    err = switch_err
-  end
+  local _, err = ui.select_window(self.api, state.source.session, owner, window, block)
   if err then self:notice(state, "Cannot switch to workspace: " .. tostring(err), true) end
 end
 
@@ -103,7 +89,7 @@ function Controller:open_terminal(state)
     state.project_terminal, window = created.block_ids[1], { window_id = created.window_id }
     self:disown(state, state.project_terminal)
   end
-  self:foreground(state, anchor_owner(anchor, state.source.anchor), window.window_id, state.project_terminal)
+  self:foreground(state, ui.anchor_owner(anchor, state.source.anchor), window.window_id, state.project_terminal)
   self:publish(state)
 end
 
@@ -295,8 +281,8 @@ function Controller:layout_changed(session)
       view = view or self:view(state)
       local window = window_of(view, state.panel)
       if window then
-        local panel_owner = anchor_owner(window, state.panel)
-        local detail_owner = state.detail and anchor_owner(window, state.detail) or nil
+        local panel_owner = ui.anchor_owner(window, state.panel)
+        local detail_owner = state.detail and ui.anchor_owner(window, state.detail) or nil
         if panel_owner ~= state.width_panel_owner or detail_owner ~= state.width_detail_owner then
           local mounted = false
           for _, owner in pairs { panel = panel_owner ~= state.width_panel_owner and panel_owner or nil,
@@ -332,7 +318,7 @@ function Controller:show(state)
     for _, id in ipairs(blocks(layer.layout)) do neighbors[#neighbors + 1] = id end
   end
   local source = state.source
-  local moved, owner = false, anchor_owner(window, source.anchor)
+  local moved, owner = false, ui.anchor_owner(window, source.anchor)
   if #neighbors > 1 then
     local label = window_label(state)
     local created = self:call("session.new_window", { session_id = source.session,

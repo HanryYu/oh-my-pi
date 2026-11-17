@@ -21,7 +21,11 @@ rex-omp
 
 只有主动请求 AI 筛选会消耗模型 token；布局、agent、Git 和服务观察不调用模型。忙碌会话会把筛选排在当前任务之后。更新后需新开 `rex-omp` 对话启用原生 AI 入口，不向旧会话注入补丁。面板在 GUI 挂载后再次校正比例，不持续抢回用户后续手动拖动的宽度；不冒充 Claude Desktop 的内嵌浏览器、自动验证或 `autoPort`。
 
-安装需要 macOS、Python 3.9+、Git、Rex 和 `lsof`。安装器准备私有 Bun 与匹配的官方 native binding，不替换 Homebrew 的 `omp`、升级全局 Bun 或修改账号、输入框、主题及全局 OMP 设置。fork 加载扩展时会排除已退役的 `rex-subagent-viewer`，但保留其文件给官方版及配置同步的其他机器使用。
+安装需要 macOS、Python 3.9+、Git、Rex、`lsof` 及 Xcode Command Line Tools（`xcrun swiftc`）。安装器准备私有 Bun 与匹配的官方 native binding，不替换 Homebrew 的 `omp`、升级全局 Bun 或修改账号、输入框、主题及全局 OMP 设置。fork 加载扩展时会排除已退役的 `rex-subagent-viewer`，但保留其文件给官方版及配置同步的其他机器使用。
+
+新 Rex 会话的路径链接携带来源 session 和 pane，不再假设 `file://` 指向本机。轻量 macOS 后台接收器只处理 `rex-omp-file:`，Lua 在已登记的 Rex 主机中定位来源：远端文件在新标签页用 Vim 只读查看，远端目录进入交互式 login shell；本机路径保持系统原有打开方式。不在本机创建远端文件副本，不调用模型；只向来源 pane 的所属客户端选页，尊重 Remote Control 权限。
+
+接收器不接管系统 `file:`，不修改 Rex 的自定义链接确认设置。已输出的 `file://` 链接及旧对话不热改写，新开 `rex-omp` 对话后生成带来源的新链接；显式配置的 `PI_LINK_SCHEME`、`PI_LINK_HOST` 优先。
 
 ## 更新与回退
 
@@ -30,6 +34,8 @@ rex-omp fork-info
 rex-omp update
 rex-omp rollback
 ```
+
+从不含路径接收器的旧版首次升级时，在规范源码目录执行 `git pull --ff-only`，再运行 `python3 scripts/rex.py update` 引导一次。安装清单 v2 会让旧升级器明确拒绝不完整候选，避免生成新链接却没有接收器；之后照常使用 `rex-omp update`。
 
 更新在候选 checkout 中合并 fork 的 `rex` 分支与官方 stable release，冻结安装依赖并检查 native binding、任务归属、只读行为及 CLI 后才切换。冲突或验证失败会明确报错，当前可用版本保持不变；fork 并不保证未来所有上游变更都无需人工处理。
 

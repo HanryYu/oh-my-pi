@@ -21,7 +21,11 @@ Private project configuration is shared by every Git worktree through the canoni
 
 Only the explicit AI selection request consumes model tokens; layout, agents, Git and server observation do not call a model. Busy sessions queue selection after their current task. Start a new `rex-omp` conversation after updating to enable this native action; existing conversations are not patched in place. The sidebar reapplies its width after the GUI mounts new observer panes, without continuously overriding later manual resizing. This does not implement Claude Desktop's embedded browser, automatic verification or `autoPort`.
 
-The installer needs macOS, Python 3.9+, Git, Rex and `lsof`. It prepares a compatible private Bun and matching official native bindings. It does not replace Homebrew's `omp`, upgrade the global Bun, or change accounts, the composer, themes or global OMP settings. The fork skips the retired `rex-subagent-viewer` extension when loading extensions. Its files remain available to official OMP and configuration-sync peers.
+The installer needs macOS, Python 3.9+, Git, Rex, `lsof` and Xcode Command Line Tools (`xcrun swiftc`). It prepares a compatible private Bun and matching official native bindings. It does not replace Homebrew's `omp`, upgrade the global Bun, or change accounts, the composer, themes or global OMP settings. The fork skips the retired `rex-subagent-viewer` extension when loading extensions. Its files remain available to official OMP and configuration-sync peers.
+
+Path links from new Rex sessions carry their source session and pane instead of assuming `file://` means this Mac. A small background macOS receiver handles only `rex-omp-file:`. Lua finds the source among registered Rex hosts: remote files open read-only in Vim in a new tab, and remote directories open an interactive login shell. Local paths keep the system's normal open behavior. No local file copy is created, and no model is called. Tab selection targets only the source pane's owning app and respects Remote Control permissions.
+
+The receiver does not replace the system `file:` handler or change Rex's custom-link confirmation setting. Existing `file://` links and running conversations are not rewritten; start a new `rex-omp` conversation to generate source-aware links. Explicit `PI_LINK_SCHEME` or `PI_LINK_HOST` settings take precedence.
 
 ## Update and recovery
 
@@ -30,6 +34,8 @@ rex-omp fork-info
 rex-omp update
 rex-omp rollback
 ```
+
+Upgrading an installation from before path-link support needs one bootstrap from the current checkout: run `git pull --ff-only`, then `python3 scripts/rex.py update`. Installation manifest v2 makes older managers reject incomplete candidates rather than activate new links without a receiver. Subsequent updates use `rex-omp update` normally.
 
 Updates merge the fork's `rex` branch with an official stable release in a candidate checkout. Frozen dependencies, matching native bindings, task-attribution/readonly regressions and CLI checks must pass before activation. Conflicts or failed checks leave the current runtime active and report an error. This is a maintained fork, not a guarantee that future upstream changes will merge without intervention.
 

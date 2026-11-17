@@ -102,4 +102,12 @@ To set the sidebar width on an existing conversation, send `{"type":"set-width",
 
 Read the response and report failures. After a timeout, inspect existing state before retrying so a successful first request does not create duplicate terminals or services. A launch acknowledgement alone does not prove that a server is ready or a build passed. Verify only when the task calls for it, using the returned target and the installed Rex CLI guidance.
 
+## Open paths on their source host
+
+New managed Rex sessions emit `rex-omp-file:` path links bound to their Rex session and pane. The macOS receiver locates that exact source among registered Rex hosts. A remote file opens in a new tab with restricted read-only Vim; a remote directory opens its host account's interactive login shell there. Local paths retain normal system opening. No local file copy is created, and opening a path does not call a model.
+
+Keep this host binding. Never check a remote path on this Mac and use a local namesake as a fallback, connect to an arbitrary URL-supplied host, execute the target as a program, or change Rex's Remote Control/custom-link safety settings. Tab selection goes only to the source pane's owning app and must report a refusal.
+
+The installer registers only the dedicated protocol, not `file:`. Existing `file://` output and older immutable sessions remain unchanged; new `rex-omp` sessions generate the new links. Preserve explicit `PI_LINK_SCHEME`/`PI_LINK_HOST` overrides. The background receiver stays tied to a retained runtime so rollback does not turn a path URL into a model prompt.
+
 Project-script discovery is not Claude Desktop's embedded Browser, automatic verification, or full `autoPort` implementation. Do not claim those capabilities or silently add browser automation, port rewriting, or verification loops.

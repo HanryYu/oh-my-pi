@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import plistlib
 import re
 import shlex
 import shutil
@@ -44,6 +45,11 @@ BEGIN = b"\n-- BEGIN rex-agent-workspace (managed)\n"
 END = b"-- END rex-agent-workspace (managed)\n"
 VERSION = re.compile(r"\d+\.\d+\.\d+\Z")
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
+LINK_APP = "Rex OMP Links.app"
+LINK_BUNDLE = "com.rexomp.path-links"
+LINK_SCHEME = "rex-omp-file"
+LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+REX_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 TESTS = (
     "packages/coding-agent/test/rex/bridge.test.ts",
     "packages/coding-agent/test/rex/journal.test.ts",
@@ -214,8 +220,8 @@ def integrate_upstream(source, upstream, tag, initial_base=None):
 
 def manifest(source):
     value = json_read(source / MANIFEST)
-    if value.get("schema") != 1 or value.get("protocol") != {"root": 3, "live": 1}:
-        raise RexError("Unsupported fork workspace protocol")
+    if value.get("schema") != 2 or value.get("protocol") != {"root": 3, "live": 1}:
+        raise RexError("Unsupported fork installation protocol; bootstrap with the current scripts/rex.py")
     if not set(TESTS).issubset(value.get("validationTests", [])):
         raise RexError("Fork validation suite is incomplete")
     for name in value.get("requiredFeatures", []) + list(TESTS):
@@ -411,6 +417,76 @@ def launcher_bytes(prefix, runtime, active=False):
     return ("#!/bin/sh\n" + MARKER + "exec " + shlex.join(argv) + ' "$@"\n').encode()
 
 
+def compile_link_handler(runtime):
+    source = runtime / "source" / RESOURCE
+    for name in ("RexPathLinkHandler.swift", "path_links.py", "path_opener.py"):
+        if not safe_path(source / name).is_file():
+            raise RexError("Path link resource is missing: " + name)
+    executable = runtime / "path-link-handler"
+    run(["/usr/bin/xcrun", "swiftc", "-O", "-framework", "AppKit",
+         source / "RexPathLinkHandler.swift", "-o", executable], timeout=600)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RexError("Swift path link handler was not produced")
+    executable.chmod(0o700)
+    return {"path": executable.name, "sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+
+
+def link_handler(runtime, metadata):
+    proof = metadata.get("pathLinkHandler")
+    if proof is None:
+        return None  # Retained runtimes predating the URL receiver stay immutable.
+    if not isinstance(proof, dict) or proof.get("path") != "path-link-handler":
+        raise RexError("Invalid path link handler metadata")
+    executable = safe_path(runtime / proof["path"])
+    if (not executable.is_file() or not os.access(executable, os.X_OK)
+            or hashlib.sha256(executable.read_bytes()).hexdigest() != proof.get("sha256")):
+        raise RexError("Path link handler failed integrity validation")
+    for name in ("path_links.py", "path_opener.py"):
+        if not safe_path(runtime / "source" / RESOURCE / name).is_file():
+            raise RexError("Path link resource is missing: " + name)
+    return executable
+
+
+def check_link_app(app, prefix):
+    if not app.exists():
+        return
+    if not app.is_dir():
+        raise RexError("Path link application is not a directory: " + str(app))
+    info = safe_path(app / "Contents/Info.plist")
+    try:
+        value = plistlib.loads(info.read_bytes())
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise RexError("Cannot inspect existing path link application: " + str(error)) from error
+    launcher = value.get("RexOMPLauncher", "")
+    if (value.get("CFBundleIdentifier") != LINK_BUNDLE
+            or value.get("CFBundleURLTypes") != [{"CFBundleURLName": LINK_BUNDLE,
+                                                 "CFBundleURLSchemes": [LINK_SCHEME]}]
+            or not isinstance(launcher, str) or not Path(launcher).is_absolute()
+            or not inside(safe_path(launcher), prefix / "runtimes")
+            or Path(launcher).name != "rex-omp"):
+        raise RexError("Refusing to overwrite an unrelated path link application: " + str(app))
+
+
+def stage_link_app(stage, executable, runtime):
+    contents = stage / "Contents"
+    (contents / "MacOS").mkdir(mode=0o700, parents=True)
+    shutil.copy2(executable, contents / "MacOS/RexPathLinkHandler")
+    info = {"CFBundleIdentifier": LINK_BUNDLE, "CFBundleName": "Rex OMP Links",
+            "CFBundleExecutable": "RexPathLinkHandler", "CFBundlePackageType": "APPL",
+            "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+            "LSUIElement": True, "NSHighResolutionCapable": True,
+            "CFBundleURLTypes": [{"CFBundleURLName": LINK_BUNDLE, "CFBundleURLSchemes": [LINK_SCHEME]}],
+            # A retained receiver must work even after active is rolled back to
+            # a runtime whose CLI predates open-link.
+            "RexOMPLauncher": str(runtime / "rex-omp")}
+    write_bytes(contents / "Info.plist", plistlib.dumps(info))
+    run(["/usr/bin/codesign", "--force", "--sign", "-", stage], timeout=60)
+
+
+def register_link_app(app, unregister=False):
+    run([LSREGISTER, "-u" if unregister else "-f", app], timeout=30)
+
+
 def prepare_candidate(prefix, origin, bun=None, upstream=UPSTREAM, upstream_version=None,
                       branch=None, native_dir=None):
     runtime, fork_commit = checkout_candidate(prefix, origin, branch=branch)
@@ -422,6 +498,7 @@ def prepare_candidate(prefix, origin, bun=None, upstream=UPSTREAM, upstream_vers
         tag = release_tag(upstream, selected_version)
         official = integrate_upstream(source, upstream, tag, base["commit"])
         private_bun = bun_runtime(prefix, source, bun)
+        handler = compile_link_handler(runtime)
         private_directory(runtime / "natives")
         frozen_dependencies(runtime, private_bun)
         native = native_addon(runtime, official["version"], private_bun, native_dir)
@@ -429,7 +506,8 @@ def prepare_candidate(prefix, origin, bun=None, upstream=UPSTREAM, upstream_vers
         metadata = {"schema": 1, "id": runtime.name, "createdAt": datetime.now(timezone.utc).isoformat(),
                     "version": official["version"], "commit": git(source, "rev-parse", "HEAD"),
                     "forkCommit": fork_commit, "fork": {"remote": str(origin), "branch": branch or BRANCH},
-                    "upstream": official, "bun": private_bun, "native": native, "validation": evidence}
+                    "upstream": official, "bun": private_bun, "native": native, "validation": evidence,
+                    "pathLinkHandler": handler}
         write_bytes(runtime / "rex-omp", launcher_bytes(prefix, runtime), 0o700)
         # Publish ready only after the complete gate; failed candidates are private.
         json_write(runtime / "runtime.json", metadata)
@@ -584,7 +662,8 @@ def apply_transaction(plans, finish=None, restore=None):
 
 
 def activate(prefix, runtime, locations, observer=True):
-    ready_runtime(prefix, runtime.name)
+    _, metadata = ready_runtime(prefix, runtime.name)
+    handler = link_handler(runtime, metadata)
     rex_dir, bin_dir = (Path(locations[name]) for name in ("rexDir", "binDir"))
     for directory in (rex_dir, bin_dir):
         safe_path(directory).mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -595,6 +674,8 @@ def activate(prefix, runtime, locations, observer=True):
         config = safe_path(rex_dir / "init.lua")
         launcher = safe_path(bin_dir / "rex-omp")
         check_launcher(launcher, prefix)
+        app = safe_path(prefix / LINK_APP)
+        check_link_app(app, prefix)
         if module.exists() and not module.is_dir():
             raise RexError("Installation module is not a directory: " + str(module))
         if config.exists() and not config.is_file():
@@ -609,7 +690,8 @@ def activate(prefix, runtime, locations, observer=True):
             module_stage = Path(tempfile.mkdtemp(prefix=".staging-module-", dir=rex_backups))
             stages.append(module_stage)
             resource = runtime / "source" / RESOURCE
-            for name in ("worker.py", "project.py"):
+            resource_names = ("worker.py", "project.py", "path_links.py", "path_opener.py") if handler else ("worker.py", "project.py")
+            for name in resource_names:
                 shutil.copy2(safe_path(resource / name), module_stage / name)
             (module_stage / "lua").mkdir(mode=0o700)
             for item in sorted((resource / "lua").glob("*.lua")):
@@ -634,17 +716,29 @@ def activate(prefix, runtime, locations, observer=True):
                           (config, config_stage, rex_backups / ("init.lua-" + stamp)),
                           (launcher, launch_stage, command_backups / ("rex-omp-" + stamp)),
                           (prefix / "active.json", state_stage, state_backups / ("active-" + stamp + ".json"))))
+            if handler:
+                app_stage = Path(tempfile.mkdtemp(prefix=".staging-links-", dir=state_backups))
+                stages.append(app_stage)
+                stage_link_app(app_stage, handler, runtime)
+                plans.append((app, app_stage, state_backups / ("path-links-" + stamp + ".app")))
             if observer:
                 stop_observer(module)
-            def restore_observer():
-                # A failed config reload may already have started the new
-                # watcher. Stop it via the immutable helper, even on first
-                # install where rollback removes the installed module.
-                stop_observer(module, resource / "worker.py")
-                reload_rex(locations["rexBinary"])
-            apply_transaction(plans,
-                              finish=(lambda: reload_rex(locations["rexBinary"])) if observer else None,
-                              restore=restore_observer if observer else None)
+            def finish():
+                if handler:
+                    register_link_app(app)
+                if observer:
+                    reload_rex(locations["rexBinary"])
+
+            def restore():
+                if handler:
+                    register_link_app(app, unregister=not app.exists())
+                if observer:
+                    # A failed reload may have started the new watcher. Use the
+                    # immutable helper even if rollback removed the module.
+                    stop_observer(module, resource / "worker.py")
+                    reload_rex(locations["rexBinary"])
+
+            apply_transaction(plans, finish=finish, restore=restore)
             return state
         finally:
             for stage in stages:
@@ -690,8 +784,24 @@ def entry(argv):
     if identifier == "active":
         identifier = load_state(prefix)["active"]
     runtime, metadata = ready_runtime(prefix, identifier)
+    if forwarded and forwarded[0] == "open-link":
+        if len(forwarded) != 2:
+            raise RexError("Usage: rex-omp open-link URL")
+        if link_handler(runtime, metadata) is None:
+            raise RexError("This retained runtime does not support path links")
+        current = load_state(prefix)
+        helper = safe_path(runtime / "source" / RESOURCE / "path_links.py")
+        os.execve(sys.executable, [sys.executable, "-B", str(helper),
+                                  "--rex", current["installation"]["rexBinary"],
+                                  "--url", forwarded[1]], dict(os.environ))
     environment = dict(os.environ, REX_WORKSPACE_OMP=str(runtime / "rex-omp"),
                        PI_NATIVES_DIR=str(runtime / "natives"))
+    if "PI_LINK_SCHEME" not in environment and "PI_LINK_HOST" not in environment:
+        session = environment.get("REX_SESSION", "").removeprefix("session:")
+        block = environment.get("REX_BLOCK", "").removeprefix("block:")
+        if REX_UUID.fullmatch(session) and REX_UUID.fullmatch(block):
+            environment["PI_LINK_SCHEME"] = LINK_SCHEME
+            environment["PI_LINK_HOST"] = session.lower() + "." + block.lower()
     # No config/profile/account/model environment overrides. exec retains PTY,
     # controlling terminal, signals and the source CLI's normal sync lifecycle.
     os.execve(metadata["bun"], [metadata["bun"], str(runtime / "source" / CLI), *forwarded], environment)

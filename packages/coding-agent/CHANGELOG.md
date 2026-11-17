@@ -10,6 +10,7 @@
 - The narrow Rex sidebar exposes detected GUI editors, a reusable project terminal, visible project scripts and actual script-process states. Launching a script requires command confirmation.
 - Add script asks the current OMP session's AI to inspect real project commands and persist up to six selected workflows; static discovery supplies candidates without executing them.
 - Selected scripts use private revision-checked project configuration shared across Git worktrees, with execution rooted in the current checkout and legacy commands retained for review.
+- Source-bound Rex path links open remote files read-only or directories in new terminal tabs on the originating host, while local paths retain system opening. A dedicated macOS URL receiver avoids model calls and leaves normal `file:` handling unchanged.
 
 ### Fixed
 
