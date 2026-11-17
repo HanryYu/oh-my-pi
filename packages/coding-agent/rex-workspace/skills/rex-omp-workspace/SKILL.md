@@ -17,23 +17,25 @@ Show and hide the sidebar with the workspace request interface below. Neither ac
 
 The workspace observer does not need model calls. Do not add a model loop or repeatedly capture screens to keep agents, project status, or service information current. Inspect only what the user's task needs.
 
-## Discover before configuring
+**Add script** explicitly asks this OMP session's AI to inspect and curate commands. It consumes tokens only for that user-requested work; it does not create another conversation or enable background AI polling. Busy sessions queue the request after their current task. Older running OMP sessions need a new `rex-omp` conversation for this native action.
+
+## Curate before configuring
 
 Project-script discovery reads existing `package.json` scripts and lockfiles, `.claude/launch.json`, `Makefile`, `justfile`, and script files at the project/package root and under `scripts/`, `script/`, `bin/`, and `tools/` (up to three directory levels). It skips symlinks, hidden/generated/dependency directories and reports scan limits. Root shell scripts, workflow-named scripts, executable scripts, and conventional script-directory entries are discovered without running them. TypeScript files need a declared shebang; do not choose a runner merely because it is installed. Discovery must not execute repository commands, install dependencies, start services, or evaluate build files as a way to list commands.
 
-When the user asks to set up a development workflow, first read the project's actual configuration, dependencies, and documentation. Check its package-manager choice and the tools available on the project host. Reuse discovered commands. Add missing editor, development/start, or build commands only when those sources establish how they should work. Do not guess that a project has `dev` or `build`, choose a package manager from habit, or claim that an editor is installed without checking.
+Read the project's actual configuration, dependencies, documentation and relevant script contents. Check its package-manager choice and tools on the project host. Choose the few commands most useful for everyday work, usually 3–5 and never more than 6. Preserve their useful ordering. Candidates do not appear in the sidebar until AI selects and saves them. Do not fill unused slots, guess commands, or select everything discovered.
 
-Before adding a script, inspect the project's existing build/start/compile scripts, their contents, argument parsing and references in README/build configuration. Reuse the actual file with its required flags and correct working directory instead of generating a second implementation or registering a guessed command. Prefer existing package/Make/Just/launch wrappers that supply setup or arguments. If a verified workflow is outside automatic discovery or needs parameters, register its complete invocation with `scripts ... add`. Never run a script or its `--help` option just to discover it.
+Inspect existing build/start/compile scripts, their arguments and README/build references. Reuse the actual file with required flags and the correct working directory instead of generating a second implementation. Prefer established package/Make/Just/launch wrappers. Save a complete, portable invocation when parameters are required; never run a script or its `--help` option just to discover it.
 
-File discovery refreshes automatically: new scripts appear, removed scripts disappear, and content/interpreter changes invalidate old execution IDs. These entries are not copied into private configuration, so deleted files do not leave saved stale commands. A direct file entry does not establish that its arguments, credentials or interactive input are optional; inspect those requirements before choosing Run or saving a parameterized command.
+Candidate discovery follows file additions/removals and content/interpreter changes invalidate old execution IDs. It does not automatically pin new files. Legacy private commands remain available as review candidates, not automatic sidebar selections. A file entry does not establish that its arguments, credentials or interactive input are optional.
 
-When a coding task adds or changes a reusable development/start/build workflow, refresh discovery and register any verified missing custom commands as part of that task. Do not make the user transcribe commands already established by the repository. Discovery and saving remain separate from execution.
+When the user asks to configure a workflow, inspect and reconcile the complete selected list. Keep important existing choices unless the project evidence requires changing them. Discovery, selection and saving remain separate from execution.
 
 Commands run on the host containing the project. A remote terminal editor runs remotely. A remote GUI launcher does not open an editor on the user's local Mac. Use the Rex host guidance when the project is elsewhere, and describe the actual host rather than silently falling back to this machine.
 
 Do not write credentials, tokens, or secret environment values into saved commands. Report missing configuration instead. Discovery or saving alone never authorizes execution. Execute only for the requested task, its necessary verification, or an explicit Run confirmation; never start a server, publish, or commit merely to populate the sidebar.
 
-## List and save private commands
+## Inspect and replace the shared selection
 
 Find the absolute filesystem path of this loaded `SKILL.md` from the skill read result. Set `skill_dir` to its containing directory, not to a user-wide skill directory or a mutable deployment symlink. Resolve the worker relative to this skill's immutable runtime source:
 
@@ -44,16 +46,23 @@ project_dir="$PWD" # Use the actual absolute project directory on this host.
 python3 "$worker" scripts --cwd "$project_dir" list
 ```
 
-`list` returns JSON with `scripts` and `errors`. Read both. It needs no active OMP session. List first to avoid duplicating a discovered or saved command, and use the IDs returned by discovery instead of constructing IDs yourself.
-
-To save a missing command, set `name` and `command` from the inspected project/tool configuration, then use:
+`list` returns only selected `scripts`, `errors`, and `project` metadata. Use `discover` to inspect all static and legacy `candidates` together with the current selection:
 
 ```sh
-python3 "$worker" scripts --cwd "$project_dir" add \
-  --name "$name" --command "$command"
+python3 "$worker" scripts --cwd "$project_dir" discover
 ```
 
-This saves private workspace configuration. It does not run the command or edit project manifests. Adding the same name and command is idempotent. If that name already has different content, preserve it unless the user explicitly asked to replace it; only then repeat `add` with `--replace`. Do not use replacement merely to make a setup command succeed.
+Read `errors`, inspect the actual files, and take `project.revision` from this result. Save the complete AI-selected list, not an append-only inventory:
+
+```sh
+python3 "$worker" scripts --cwd "$project_dir" set --revision "$revision" <<'JSON'
+{"scripts":[{"name":"Build","command":"./scripts/build.sh","cwd":"."}]}
+JSON
+```
+
+The example is a schema illustration, not a command to assume exists. Use only verified project commands. `cwd` is relative to the current checkout root; do not embed checkout-specific absolute paths or secrets. Saving never executes a command or changes project manifests.
+
+Configuration is private, versioned and keyed by the canonical Git common directory. All worktrees of the same repository read the same selection; commands execute in the current checkout, never another worktree. Non-Git projects use their directory identity. A revision conflict means another worktree changed the selection: discover again and reconcile before saving. Do not blindly overwrite it. Legacy configuration files are preserved for review.
 
 Detected GUI editors already have an **Open in …** action; do not save a duplicate launcher. Terminal editors such as `nvim` need an interactive project terminal. Never save them as background scripts: project scripts have no interactive standard input.
 
@@ -89,7 +98,7 @@ printf '%s\n' '{"type":"open-terminal"}' |
 
 For a detected GUI editor, use `{"type":"open-editor"}` through the same request interface. A project terminal is reused and selected inside Rex; hiding the sidebar does not close it.
 
-To set the sidebar width on an existing conversation, send `{"type":"set-width","width":20}` through the same request interface. Width is an integer percentage from 15 to 35. This saves a workspace override, applies the actual Rex split, and survives observer restart without restarting the conversation or its agents. Ordinary status updates do not undo manual border dragging; an explicit show restores the configured width.
+To set the sidebar width on an existing conversation, send `{"type":"set-width","width":20}` through the same request interface. Width is an integer percentage from 15 to 35. This saves a workspace override, applies the actual Rex split, and survives observer restart without restarting the conversation or its agents. The controller also corrects the split once after the GUI mounts a new observer pane. Ordinary status updates do not undo subsequent manual border dragging; an explicit show restores the configured width.
 
 Read the response and report failures. After a timeout, inspect existing state before retrying so a successful first request does not create duplicate terminals or services. A launch acknowledgement alone does not prove that a server is ready or a build passed. Verify only when the task calls for it, using the returned target and the installed Rex CLI guidance.
 

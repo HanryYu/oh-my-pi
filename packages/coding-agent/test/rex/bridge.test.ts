@@ -480,3 +480,84 @@ test("retired Rex modules and prepared factories never execute, while ordinary e
 		else process.env.REX_SUBAGENT_VIEWER = disabled;
 	}
 });
+
+test("script selection rejects a different checkout and queues once without completing with the preceding task", async () => {
+	const saved = { REX_BLOCK: process.env.REX_BLOCK, REX_SESSION: process.env.REX_SESSION,
+		REX_SUBAGENT_VIEWER: process.env.REX_SUBAGENT_VIEWER, REX_WORKSPACE_SCAN_DIR: process.env.REX_WORKSPACE_SCAN_DIR,
+		REX_WORKSPACE_WIDTH: process.env.REX_WORKSPACE_WIDTH, REX_WORKSPACE_OMP: process.env.REX_WORKSPACE_OMP };
+	const scan = fs.mkdtempSync("/tmp/rex-script-action-");
+	process.env.REX_BLOCK = `script-${crypto.randomUUID()}`;
+	process.env.REX_SESSION = "script-action";
+	process.env.REX_WORKSPACE_SCAN_DIR = scan;
+	process.env.REX_SUBAGENT_VIEWER = "1";
+	delete process.env.REX_WORKSPACE_WIDTH;
+	delete process.env.REX_WORKSPACE_OMP;
+	const hash = crypto.createHash("sha256").update(process.env.REX_BLOCK).digest("hex").slice(0, 10);
+	const directory = path.join(scan, `rsv-${process.getuid?.()}-${process.pid}-${hash}`);
+	const handlers = new Map<string, Hook>();
+	const timers = new Map<number, () => void>();
+	const deliveries: Array<{ content: string; options?: { deliverAs?: string; attribution?: string } }> = [];
+	let timer = 0;
+	let idle = false;
+	let reject = false;
+	const ctx = { agent: { id: "Main", kind: "main" }, cwd: scan, isIdle: () => idle,
+		sessionManager: { getSessionId: () => "script-session", getSessionFile: () => path.join(scan, "session.jsonl"),
+			getSessionName: () => undefined, getArtifactsDir: () => path.join(scan, "session") },
+		setInterval(callback: () => void) { timers.set(++timer, callback); return timer; },
+		setTimeout(callback: () => void) { timers.set(++timer, callback); return timer; },
+		clearTimer(id: number) { timers.delete(id); }, ui: { notify() {} } } as unknown as ExtensionContext;
+	const pi = { pi: { AgentRegistry: { global: () => ({ get: () => undefined, onChange: () => () => {} }) } },
+		logger: { warn() {} }, events: { on: () => () => {} }, registerCommand() {},
+		on(name: string, hook: Hook) { handlers.set(name, hook); },
+		sendUserMessage(content: string, options?: { deliverAs?: string; attribution?: string }) {
+			deliveries.push({ content, options });
+			return reject ? Promise.reject(new Error("cost cap")) : Promise.resolve();
+		} } as unknown as ExtensionAPI;
+	const emit = (name: string, event: Record<string, unknown> = {}) => handlers.get(name)?.(event, ctx);
+	const poll = () => { for (const callback of [...timers.values()]) callback(); };
+	const snapshot = () => JSON.parse(fs.readFileSync(path.join(directory, "root.json"), "utf8")) as
+		{ taskId: string; scriptCuration?: { id: string; phase: string; error?: string } };
+	const issue = (id: string, cwd = scan) => {
+		fs.writeFileSync(path.join(directory, "curation-request.json"), JSON.stringify({ v: 1, type: "curate-scripts",
+			id, pid: process.pid, sessionId: "script-session", anchor: process.env.REX_BLOCK, cwd, taskId: snapshot().taskId }),
+			{ mode: 0o600 });
+		poll();
+	};
+	try {
+		rexWorkspaceBridge(pi);
+		emit("session_start");
+		fs.writeFileSync(path.join(directory, "curation-request.json"), "{}", { mode: 0o600 });
+		poll();
+		expect(snapshot().scriptCuration?.phase).toBe("error");
+		issue(crypto.randomUUID(), "/");
+		expect(deliveries).toHaveLength(0);
+		expect(snapshot().scriptCuration?.phase).toBe("error");
+		expect(fs.existsSync(path.join(directory, "curation-request.json"))).toBe(false);
+		const id = crypto.randomUUID();
+		issue(id);
+		expect(deliveries.map(delivery => delivery.options?.deliverAs)).toEqual(["followUp"]);
+		emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(snapshot().scriptCuration?.phase).toBe("queued");
+		issue(id);
+		expect(deliveries).toHaveLength(1);
+		emit("message_start", { message: { role: "user", content: deliveries[0].content, attribution: "user" } });
+		expect(snapshot().scriptCuration?.phase).toBe("running");
+		emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }], awaitingAsyncWork: true });
+		expect(snapshot().scriptCuration?.phase).toBe("running");
+		emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+		expect(snapshot().scriptCuration?.phase).toBe("done");
+		idle = true;
+		reject = true;
+		issue(crypto.randomUUID());
+		await Promise.resolve();
+		expect(deliveries[1].options?.deliverAs).toBeUndefined();
+		expect(snapshot().scriptCuration?.phase).toBe("error");
+		expect(snapshot().scriptCuration?.error).toContain("cost cap");
+	} finally {
+		emit("session_shutdown");
+		for (const [name, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[name]; else process.env[name] = value;
+		}
+		fs.rmSync(scan, { recursive: true, force: true });
+	}
+});

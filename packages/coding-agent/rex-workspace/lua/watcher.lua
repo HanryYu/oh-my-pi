@@ -62,6 +62,12 @@ end
 rex.on("block_closed", function(ctx, ev)
   if controller and not stopping then controller:block_closed(ctx.session_id, ev.block_id) end
 end)
+rex.on("session_view_changed", function(ctx)
+  if controller and not stopping then
+    local ok, err = pcall(controller.layout_changed, controller, ctx.session_id)
+    if not ok then log(err) end
+  end
+end)
 rex.on("session_destroyed", function(_, ev)
   if not controller or stopping then return end
   local roots = {}

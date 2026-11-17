@@ -8,8 +8,8 @@
 - `rex-view` renders a selected subagent's original transcript and live in-flight content without creating a model session.
 - The fork's `rex-omp` installer supports validated official-release updates and rollback without replacing the official OMP installation.
 - The narrow Rex sidebar exposes detected GUI editors, a reusable project terminal, visible project scripts and actual script-process states. Launching a script requires command confirmation.
-- Project commands are discovered without execution from package scripts, supported Claude launch configurations, Make targets and parameter-free Just recipes. The bundled `rex-omp-workspace` skill can register verified private commands without starting them.
-- Existing project script files appear automatically in Rex Scripts, follow file additions/removals, and defer to configured wrappers instead of duplicating them.
+- Add script asks the current OMP session's AI to inspect real project commands and persist up to six selected workflows; static discovery supplies candidates without executing them.
+- Selected scripts use private revision-checked project configuration shared across Git worktrees, with execution rooted in the current checkout and legacy commands retained for review.
 
 ### Fixed
 
@@ -20,6 +20,8 @@
 - New Rex workspace tabs open in the conversation's owning app with input focused on the conversation.
 - Rex workspace tabs follow native session titles, use the project name before a title exists, and preserve subsequent manual renames.
 - Rex workspaces default to an 80/20 split, reapply configured widths when restoring existing panels, and can save width changes for running conversations without restarting them.
+- Rex corrects sidebar widths after GUI ownership handoff, including agent-detail mounting, without continuously overriding later manual resizing.
+- Project script configuration follows the originating OMP session's config home even when the Rex observer has a different environment.
 
 ## [18.20.0] - 2026-11-12
 

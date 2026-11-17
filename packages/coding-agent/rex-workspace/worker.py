@@ -22,11 +22,12 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlparse
+import uuid
 
 from project import ProjectError, ProjectState
 
 FRAME_LIMIT = 1024 * 1024
-PUBLISH_NAMES = frozenset(("view.json", "workspace.json", "preview.json"))
+PUBLISH_NAMES = frozenset(("view.json", "workspace.json", "preview.json", "curation-request.json"))
 ROOT_PATTERN = re.compile(r"rsv-(\d+)-(\d+)-([a-f0-9]{10})\Z")
 
 
@@ -99,7 +100,12 @@ def atomic_json(root, name, data):
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(raw)
-        os.replace(temporary, root / name)
+        if name == "curation-request.json":
+            # Atomic exclusive publication: concurrent clicks cannot replace the
+            # mailbox, including an existing symlink or unsafe file.
+            os.link(temporary, root / name, follow_symlinks=False)
+        else:
+            os.replace(temporary, root / name)
     finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)
@@ -139,6 +145,9 @@ def validate_source(root, live=True):
     if command_path is not None and (not isinstance(command_path, str) or "\0" in command_path
             or any(not os.path.isabs(item) for item in command_path.split(os.pathsep))):
         raise ValueError("command PATH must contain only absolute directories")
+    config_home = source.get("configHome")
+    if config_home is not None and (not isinstance(config_home, str) or not os.path.isabs(config_home) or "\0" in config_home):
+        raise ValueError("source configHome must be absolute")
     main = source.get("main")
     if not isinstance(main, dict) or not isinstance(main.get("cwd"), str) or not os.path.isabs(main["cwd"]) or "\0" in main["cwd"]:
         raise ValueError("source cwd must be absolute")
@@ -173,6 +182,23 @@ def validate_source(root, live=True):
     if live and (source["closed"] or not alive(pid)):
         raise ValueError("source has ended")
     return root, source
+
+
+def request_script_curation(root):
+    root, source = validate_source(root)
+    capabilities = source.get("capabilities")
+    if not isinstance(capabilities, dict) or capabilities.get("scriptCuration") is not True:
+        raise ValueError("Start a new OMP session to add scripts")
+    curation = source.get("scriptCuration")
+    if isinstance(curation, dict) and curation.get("phase") in ("queued", "running"):
+        raise ValueError("Script selection is already pending")
+    if os.path.lexists(root / "curation-request.json"):
+        raise ValueError("Script selection request already exists")
+    request = {"v": 1, "type": "curate-scripts", "id": str(uuid.uuid4()),
+               "pid": source["pid"], "sessionId": source["sessionId"],
+               "anchor": source["anchor"], "cwd": source["main"]["cwd"], "taskId": source["taskId"]}
+    atomic_json(root, "curation-request.json", request)
+    return request
 
 
 
@@ -240,11 +266,12 @@ class ProjectSlot:
     """One serial work stream per source; generations discard retired results."""
 
     def __init__(self, source, root, generation):
-        self.identity = (source["pid"], source["sessionId"], source["main"]["cwd"])
+        self.identity = (source["pid"], source["sessionId"], source["main"]["cwd"], source.get("configHome"))
         directory = private_directory(root / "project", create=True)
         self.project = ProjectState(self.identity[2], self.identity[0], directory,
                                     omp_executable=source["ompExecutable"],
-                                    command_path=source.get("commandPath"), agent_dir=source.get("agentDir"))
+                                    command_path=source.get("commandPath"), agent_dir=source.get("agentDir"),
+                                    config_home=source.get("configHome"))
         self.generation = generation
         self.snapshot = {}
         self.pending = deque()
@@ -272,8 +299,6 @@ class ProjectSlot:
             return project.diff()
         if kind == "commit":
             return project.commit(request.get("message"))
-        if kind == "add-script":
-            return project.add_script(request.get("name"), request.get("command"))
         if kind == "run-script":
             return project.run_script(request.get("id"))
         if kind == "open-editor":
@@ -386,7 +411,7 @@ class Watcher:
                     key = str(root)
                     found.add(key)
                     entry = self.roots.get(key)
-                    identity = (source["pid"], source["sessionId"], source["main"]["cwd"])
+                    identity = (source["pid"], source["sessionId"], source["main"]["cwd"], source.get("configHome"))
                     if entry is None:
                         # A module-level singleton is insufficient when two Rex
                         # profiles scan the same OMP source. Claim the root first.
@@ -439,7 +464,7 @@ class Watcher:
             raise ValueError("unknown or inactive source")
         if active:
             _, source = validate_source(root)
-            identity = (source["pid"], source["sessionId"], source["main"]["cwd"])
+            identity = (source["pid"], source["sessionId"], source["main"]["cwd"], source.get("configHome"))
             if identity != entry["identity"]:
                 raise ValueError("source changed; wait for fresh snapshot")
         return entry
@@ -467,13 +492,17 @@ class Watcher:
                 self.generation += 1
                 entry["project"] = ProjectSlot(entry["source"], entry["root"], self.generation)
             entry["project"].enqueue("refresh")
+        elif kind == "curate-scripts":
+            request_script_curation(entry["root"])
+            self.emit({"type": "response", "root": root, "event": {
+                "type": "notice", "text": ""}})
         elif kind == "project":
             slot = entry.get("project")
             request = command.get("request")
             if not slot or not isinstance(request, dict):
                 raise ValueError("project is not observed")
             action = request.get("type")
-            if action not in ("diff", "commit", "run-script", "add-script", "open-editor", "open-url"):
+            if action not in ("diff", "commit", "run-script", "open-editor", "open-url"):
                 raise ValueError("unknown project action")
             if action in ("run-script", "open-url"):
                 rows = slot.snapshot.get("scripts" if action == "run-script" else "servers", [])
@@ -760,14 +789,13 @@ def main(argv=None):
     command.add_argument("--session")
     command.add_argument("--anchor")
     command.add_argument("--view", choices=("panel", "detail", "preview"), required=True)
-    command = commands.add_parser("scripts", help="Discover or save project commands without executing them")
+    command = commands.add_parser("scripts", help="Inspect candidates or replace curated commands without executing them")
     command.add_argument("--cwd", required=True)
     script_commands = command.add_subparsers(dest="script_action", required=True)
     script_commands.add_parser("list")
-    add = script_commands.add_parser("add")
-    add.add_argument("--name", required=True)
-    add.add_argument("--command", dest="script_command", required=True)
-    add.add_argument("--replace", action="store_true")
+    script_commands.add_parser("discover")
+    replace = script_commands.add_parser("set")
+    replace.add_argument("--revision", type=int, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "watch":
@@ -783,11 +811,16 @@ def main(argv=None):
             with tempfile.TemporaryDirectory(prefix="rex-project-commands-") as state_dir:
                 project = ProjectState(str(cwd), os.getpid(), state_dir)
                 try:
-                    message = project.add_script(args.name, args.script_command, replace=args.replace) if args.script_action == "add" else None
-                    result = project.script_snapshot()
+                    if args.script_action == "set":
+                        raw = sys.stdin.buffer.read(FRAME_LIMIT + 1)
+                        if len(raw) > FRAME_LIMIT:
+                            raise ValueError("script configuration exceeds 1MiB")
+                        value = json.loads(raw)
+                        if not isinstance(value, dict) or set(value) != {"scripts"} or not isinstance(value["scripts"], list):
+                            raise ValueError("stdin must be an object containing a scripts array")
+                        project.set_scripts(value["scripts"], args.revision)
+                    result = project.candidate_snapshot() if args.script_action == "discover" else project.script_snapshot()
                     result["editor"] = project.editor_info()
-                    if message:
-                        result["message"] = message
                     print(json.dumps(result, ensure_ascii=False))
                 finally:
                     project.close()

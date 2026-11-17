@@ -140,6 +140,7 @@ function Controller:publish(state)
   self:write(state, "view.json", { v = 1, root = state.root, main = source.main,
     sessionFile = source.sessionFile, ompExecutable = source.ompExecutable, taskId = source.taskId,
     agentDir = source.agentDir,
+    capabilities = source.capabilities or {}, scriptCuration = source.scriptCuration,
     diagnostics = source.diagnostics or {},
     project = state.project or {}, agents = source.agents or {}, selected = state.selected,
     notice = state.notice, noticeError = state.notice_error, closed = state.hidden or self.stopping })
@@ -287,6 +288,34 @@ function Controller:apply_width(state)
   state.width_applied = state.width
 end
 
+function Controller:layout_changed(session)
+  local view
+  for _, state in pairs(self.roots) do
+    if state.source.session == session and state.panel and not state.hidden then
+      view = view or self:view(state)
+      local window = window_of(view, state.panel)
+      if window then
+        local panel_owner = anchor_owner(window, state.panel)
+        local detail_owner = state.detail and anchor_owner(window, state.detail) or nil
+        if panel_owner ~= state.width_panel_owner or detail_owner ~= state.width_detail_owner then
+          local mounted = false
+          for _, owner in pairs { panel = panel_owner ~= state.width_panel_owner and panel_owner or nil,
+              detail = detail_owner ~= state.width_detail_owner and detail_owner or nil } do
+            local result = self.api.call("client.inspect", { client_id = owner })
+            if result and result.client and result.client.info and result.client.info.kind == "app" then mounted = true end
+          end
+          state.width_panel_owner, state.width_detail_owner = panel_owner, detail_owner
+          -- The app can restore its cached split after taking a newly mounted
+          -- terminal. Apply once after its initial layout events have settled.
+          state.width_settle_ticks = mounted and 2 or nil
+        elseif state.width_settle_ticks then
+          state.width_settle_ticks = 2
+        end
+      end
+    end
+  end
+end
+
 function Controller:show(state)
   local view, window = self:valid_anchor(state)
   state.validated = true
@@ -327,6 +356,7 @@ function Controller:show(state)
     state.panel, state.window = created.block_ids[1], window.window_id
   end
   state.hidden = false
+  state.width_panel_owner, state.width_detail_owner, state.width_settle_ticks = nil, nil, nil
   self:disown(state, state.panel)
   self:apply_width(state)
   self:observe(state)
@@ -455,8 +485,14 @@ function Controller:request(event)
       if state.panel and not state.hidden then self:apply_width(state) end
       self:publish(state)
     elseif kind == "select" then self:select(state, request.key)
+    elseif kind == "curate-scripts" then
+      if state.hidden or not state.panel then error("The workspace panel is closed", 0) end
+      if not state.source.capabilities or not state.source.capabilities.scriptCuration then
+        error("Open a new rex-omp conversation to select scripts with AI", 0)
+      end
+      self:emit(state, "curate-scripts")
     elseif kind == "open-terminal" then self:open_terminal(state)
-    elseif kind == "diff" or kind == "commit" or kind == "run-script" or kind == "add-script" or
+    elseif kind == "diff" or kind == "commit" or kind == "run-script" or
         kind == "open-editor" or kind == "open-url" then
       if state.hidden or not state.panel then error("The workspace panel is closed", 0) end
       self:emit(state, "project", { request = request })
@@ -509,6 +545,14 @@ end
 
 function Controller:tick(now)
   for _, state in pairs(self.roots) do
+    if state.width_settle_ticks and state.panel and not state.hidden then
+      state.width_settle_ticks = state.width_settle_ticks - 1
+      if state.width_settle_ticks == 0 then
+        state.width_settle_ticks = nil
+        local ok, err = pcall(self.apply_width, self, state)
+        if not ok then self:notice(state, err, true) end
+      end
+    end
     if not state.hidden and not state.panel and now >= state.retry_at then
       state.retry_at = now + 2
       local ok, err = pcall(self.show, self, state)

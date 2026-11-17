@@ -302,6 +302,35 @@ orphan.api.call("block.close", { block_id = osaved.panel })
 local recovery = Controller.new(orphan.api, function() end, "/module", 404)
 recovery:event { type = "source", root = "/private/root", source = clone(orphan.source), layout = osaved }
 check(not orphan.locate(osaved.detail) and orphan.locate("main"), "restart retires orphaned details without touching the conversation")
+local handoff = fixture(false)
+handoff.source.display.width = 20
+handoff.update()
+local handoff_state = handoff.state()
+local handoff_layer = handoff.view.windows[1].layers[1]
+handoff.c:layout_changed("session")
+handoff_layer.blocks[#handoff_layer.blocks + 1] = { block_id = handoff_state.panel, owner = "app-owner" }
+handoff.c:layout_changed("session")
+-- The GUI restores its cached even split after taking the terminal, later
+-- than the initial server-side ratio assignment.
+handoff_layer.layout.split.ratio = 0.5
+handoff.c:layout_changed("session")
+handoff.c:tick(0); handoff.c:tick(1)
+check(handoff_layer.layout.split.ratio == 0.8,
+  "client mount cannot leave a newly created sidebar at its cached 50/50 width")
+handoff_layer.layout.split.ratio = 0.7
+handoff.c:layout_changed("session")
+handoff.c:tick(2); handoff.c:tick(3)
+check(handoff_layer.layout.split.ratio == 0.7,
+  "the post-mount correction runs once instead of continuously overriding border dragging")
+handoff.request("select", "A:1")
+handoff_layer.blocks[#handoff_layer.blocks + 1] = { block_id = handoff_state.detail, owner = "app-owner" }
+handoff_layer.layout.split.ratio = 0.5
+handoff.c:layout_changed("session")
+handoff.c:tick(4); handoff.c:tick(5)
+check(handoff_layer.layout.split.ratio == 0.8 and handoff_state.detail ~= nil,
+  "mounting an agent detail preserves the outer 80/20 workspace split")
+handoff.c:shutdown()
+
 for _, neighbor in ipairs { false, true } do
   local proportional = fixture(neighbor)
   proportional.source.display.width = 20

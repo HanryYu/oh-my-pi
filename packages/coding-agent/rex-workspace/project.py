@@ -91,7 +91,7 @@ class ProjectState:
     DIFF_LIMIT = 512 * 1024
     SCRIPT_SCAN_LIMIT = 4096
 
-    def __init__(self, cwd, omp_pid, state_dir, *, omp_executable="omp", command_path=None, agent_dir=None):
+    def __init__(self, cwd, omp_pid, state_dir, *, omp_executable="omp", command_path=None, agent_dir=None, config_home=None):
         self.cwd = os.path.realpath(cwd)
         self.omp_pid = int(omp_pid)
         self.state_dir = Path(state_dir)
@@ -100,10 +100,13 @@ class ProjectState:
         os.chmod(self.state_dir, 0o700)
         self.root = next((str(path) for path in (Path(self.cwd), *Path(self.cwd).parents)
                           if (path / ".git").exists()), self.cwd)
-        config_home = os.environ.get("XDG_CONFIG_HOME", "")
+        config_home = config_home if config_home is not None else os.environ.get("XDG_CONFIG_HOME", "")
         if not os.path.isabs(config_home):
             config_home = str(Path.home() / ".config")
-        self.config = Path(config_home) / "rex-subagent-viewer" / "projects" / (_identity(self.cwd) + ".json")
+        self._config_directory = Path(config_home) / "rex-subagent-viewer" / "projects"
+        self.project_key = "dir-" + _identity(self.cwd)
+        self.config = self._config_directory / (self.project_key + ".json")
+        self._worktrees = [self.root]
         self._lock = threading.RLock()
         self._scripts = {}
         self._children = []
@@ -122,6 +125,7 @@ class ProjectState:
             self._env["PATH"] = command_path
         if agent_dir is not None:
             self._env["PI_CODING_AGENT_DIR"] = agent_dir
+        self._env["XDG_CONFIG_HOME"] = config_home
 
     def _run(self, args, cwd=None, timeout=None, allowed=(0,), input=None):
         try:
@@ -273,19 +277,98 @@ class ProjectState:
         except (ValueError, UnicodeError) as error:
             raise ProjectError("配置 JSON 无效: " + str(path)) from error
 
-    def _custom_scripts(self):
+    def _script_project(self):
+        if self._repository():
+            common = os.fsdecode(self._git("rev-parse", "--git-common-dir").stdout.rstrip(b"\n"))
+            common = os.path.realpath(os.path.join(self.cwd, common))
+            self.project_key = "git-" + _identity(common)
+            listing = self._git("worktree", "list", "--porcelain", "-z").stdout
+            self._worktrees = [os.path.realpath(os.fsdecode(field[9:]))
+                               for field in listing.split(b"\0") if field.startswith(b"worktree ")]
+            self._worktrees = list(dict.fromkeys([self.root, *self._worktrees]))
+        else:
+            self.project_key = "dir-" + _identity(self.cwd)
+            self._worktrees = [self.cwd]
+        self.config = self._config_directory / (self.project_key + ".json")
+
+    def _script_directory(self, value):
+        if (not isinstance(value, str) or not value or "\0" in value or os.path.isabs(value)
+                or any(unicodedata.category(c) == "Cs" for c in value) or ".." in Path(value).parts):
+            raise ProjectError("命令 cwd 必须是项目内相对路径，不能含 ..")
+        directory = os.path.realpath(os.path.join(self.root, value))
+        if not _within(directory, self.root) or not os.path.isdir(directory):
+            raise ProjectError("命令 cwd 必须是当前 checkout 内已有目录: " + _text(value))
+        return os.path.relpath(directory, self.root), directory
+
+    def _validate_portable_command(self, command, cwd):
+        # Commands are shell programs, not merely argv. Inspect absolute path
+        # occurrences even inside quotes, assignments and nested shell strings.
+        for root in self._worktrees:
+            if re.search(re.escape(root) + r"(?=$|[/\s'\";|&()<>=])", command):
+                raise ProjectError("共享命令不能保存 checkout 绝对路径，请使用相对路径: " + _text(root))
+        for match in re.finditer(r"/[^\s'\";|&()<>=]+", command):
+            path = match[0].rstrip(",")
+            if any(_within(path, root) for root in self._worktrees):
+                raise ProjectError("共享命令不能指向 checkout 绝对路径: " + _text(path))
+        try:
+            words = shlex.split(command)
+        except ValueError as error:
+            raise ProjectError("命令 shell 引号无效") from error
+        for word in words:
+            if len(word) > 4096 or "\n" in word:
+                continue
+            word = word.split("=", 1)[-1]
+            if os.path.isabs(word) and any(_within(word, root) for root in self._worktrees):
+                raise ProjectError("共享命令不能指向 checkout 绝对路径: " + _text(word))
+            path = os.path.realpath(os.path.join(cwd, word))
+            if any(root != self.root and _within(path, root) for root in self._worktrees):
+                raise ProjectError("命令不能回落其他 worktree: " + _text(word))
+
+    def _curated_config(self):
         if not self.config.exists():
-            return []
+            return {"v": 2, "project": self.project_key, "revision": 0, "scripts": []}
         data = self._read_json(self.config)
-        if not isinstance(data, dict) or data.get("v") != 1 or data.get("cwd") != self.cwd or not isinstance(data.get("scripts"), list):
-            raise ProjectError("项目命令配置格式无效: " + str(self.config))
-        scripts = []
-        for item in data["scripts"]:
-            if not isinstance(item, dict):
-                raise ProjectError("项目命令配置条目无效")
-            name, command = self._validate_script(item.get("name"), item.get("command"))
-            scripts.append({"name": name, "command": command})
-        return scripts
+        if (not isinstance(data, dict) or data.get("v") != 2 or data.get("project") != self.project_key
+                or type(data.get("revision")) is not int or data["revision"] < 0
+                or not isinstance(data.get("scripts"), list) or len(data["scripts"]) > 6):
+            raise ProjectError("项目精选命令配置格式无效: " + str(self.config))
+        return data
+
+    def _legacy_scripts(self, scripts, errors):
+        if not self._config_directory.exists():
+            return
+        for index, path in enumerate(sorted(self._config_directory.glob("*.json"))):
+            if index >= self.SCRIPT_SCAN_LIMIT:
+                errors.append("旧命令配置扫描达到上限")
+                break
+            if path == self.config or path.is_symlink():
+                continue
+            try:
+                data = self._read_json(path)
+                if not isinstance(data, dict) or data.get("v") != 1:
+                    continue
+                old_cwd = data.get("cwd")
+                if not isinstance(old_cwd, str) or not os.path.isabs(old_cwd):
+                    continue
+                old_cwd = os.path.realpath(old_cwd)
+                owner = next((root for root in sorted(self._worktrees, key=len, reverse=True)
+                              if _within(old_cwd, root)), None)
+                if owner is None or (self.project_key.startswith("dir-") and old_cwd != self.cwd):
+                    continue
+                if not isinstance(data.get("scripts"), list):
+                    raise ProjectError("旧项目命令 scripts 必须为数组")
+                relative = os.path.relpath(old_cwd, owner)
+                for row in data["scripts"]:
+                    if not isinstance(row, dict):
+                        raise ProjectError("旧项目命令条目无效")
+                    name, command = self._validate_script(row.get("name"), row.get("command"))
+                    key = "legacy-" + _identity(str(path), name, command)
+                    scripts[key] = {"id": key, "label": name, "command": command,
+                                    "source": "legacy", "kind": self._script_kind(name),
+                                    "_cwd": os.path.join(self.root, relative), "_argv": None,
+                                    "legacyConfig": str(path), "reviewRequired": True}
+            except (OSError, ProjectError) as error:
+                errors.append(_text("%s: %s" % (path, error)))
 
     @staticmethod
     def _validate_script(name, command):
@@ -324,9 +407,17 @@ class ProjectState:
 
     def _register_script(self, scripts, prefix, name, command, source, cwd, argv, stamp, env=None):
         name, command = self._validate_script(name, command)
-        key = prefix + "-" + _identity(str(cwd), name, command, stamp)
-        scripts[key] = {"id": key, "label": name, "command": command, "source": source,
-                        "kind": self._script_kind(name), "_cwd": str(cwd), "_argv": argv}
+        cwd = str(cwd)
+        portable = [os.path.relpath(word, cwd) if os.path.isabs(word) and _within(word, self.root)
+                    else word for word in argv]
+        # ./ is required for directly executed relative files, unlike arguments.
+        if os.path.isabs(argv[0]) and _within(argv[0], self.root) and "/" not in portable[0]:
+            portable[0] = "./" + portable[0]
+        invocation = shlex.join(portable)
+        key = prefix + "-" + _identity(cwd, name, invocation, stamp)
+        scripts[key] = {"id": key, "label": name, "command": invocation, "source": source,
+                        "kind": self._script_kind(name), "_cwd": cwd, "_argv": argv,
+                        "_dependencyCommand": command}
         if env is not None:
             scripts[key]["_env"] = env
 
@@ -509,7 +600,7 @@ class ProjectState:
         interpreters = {"sh", "bash", "zsh", "fish", "python", "python3", "node", "bun", "ruby", "perl", "deno", "tsx"}
         for script in scripts.values():
             try:
-                words = shlex.split(script["command"])
+                words = shlex.split(script.get("_dependencyCommand", script["command"]))
             except ValueError:
                 continue
             if not words:
@@ -594,84 +685,168 @@ class ProjectState:
         finally:
             self._script_files = cache
 
-    def _load_scripts(self):
+    def _load_candidates(self):
         scripts, errors = {}, []
         for discover in (lambda: self._package_scripts(scripts),
                          lambda: self._launch_scripts(scripts, errors),
                          lambda: self._taskfile_scripts(scripts, errors),
-                         lambda: self._taskfile_scripts(scripts, errors, just=True)):
+                         lambda: self._taskfile_scripts(scripts, errors, just=True),
+                         lambda: self._directory_scripts(scripts, errors)):
             try:
                 discover()
             except (OSError, ProjectError) as error:
                 errors.append(_text(error))
-        try:
-            for item in self._custom_scripts():
-                name, command = item["name"], item["command"]
-                self._register_script(scripts, "user", name, command, "user", self.cwd,
-                                      ["/bin/sh", "-c", command], command)
-        except (OSError, ProjectError) as error:
-            errors.append(_text(error))
-        try:
-            self._directory_scripts(scripts, errors)
-        except (OSError, ProjectError) as error:
-            errors.append(_text(error))
+        self._legacy_scripts(scripts, errors)
         return scripts, list(dict.fromkeys(errors))
 
-    def script_snapshot(self):
+    def _dependency_stamp(self, command, cwd):
+        stamps = []
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            words = [command]
+        for word in words:
+            # Include referenced script contents, also when a package wrapper
+            # suppressed its duplicate direct-file candidate.
+            try:
+                path = Path(cwd) / word
+                relevant = _within(path, self.root) and path.is_file()
+            except (OSError, ValueError):
+                continue
+            if relevant:
+                stamps.extend((os.path.relpath(path, self.root), self._read_text(path)))
+        return _identity(*stamps)
+
+    def _load_scripts(self):
+        candidates, errors = self._load_candidates()
+        try:
+            data = self._curated_config()
+        except (OSError, ProjectError) as error:
+            errors.append(_text(error))
+            return {}, candidates, errors, 0
+        scripts, names = {}, set()
+        for row in data["scripts"]:
+            try:
+                if not isinstance(row, dict):
+                    raise ProjectError("项目精选命令条目无效")
+                name, command = self._validate_script(row.get("name"), row.get("command"))
+                if name in names:
+                    raise ProjectError("精选命令名称重复: " + name)
+                names.add(name)
+                relative, cwd = self._script_directory(row.get("cwd", "."))
+                self._validate_portable_command(command, cwd)
+                matched = next((item for item in candidates.values()
+                                if item["source"] != "legacy" and item["command"] == command
+                                and item["_cwd"] == cwd), None)
+                stamps = [self._dependency_stamp(command, cwd)]
+                words = shlex.split(command)
+                for candidate in candidates.values():
+                    if candidate["source"] == "legacy" or candidate["_cwd"] != cwd:
+                        continue
+                    invocation = shlex.split(candidate["command"])
+                    # Retain source fingerprints for verified wrappers with
+                    # extra flags or shell chaining, not only exact matches.
+                    if any(words[index:index + len(invocation)] == invocation
+                           for index in range(len(words) - len(invocation) + 1)):
+                        stamps.extend((candidate["id"],
+                                       self._dependency_stamp(candidate["_dependencyCommand"], cwd)))
+                dependency = _identity(*stamps)
+                key = "curated-" + _identity(self.project_key, str(data["revision"]), name, command,
+                                             relative, dependency)
+                scripts[key] = {"id": key, "label": name, "command": command, "source": "curated",
+                                "kind": self._script_kind(name), "_cwd": cwd,
+                                "_argv": matched["_argv"] if matched else ["/bin/sh", "-c", command]}
+                if matched and "_env" in matched:
+                    scripts[key]["_env"] = matched["_env"]
+            except (OSError, ProjectError) as error:
+                errors.append(_text(error))
+        return scripts, candidates, list(dict.fromkeys(errors)), data["revision"]
+
+    def _public_scripts(self, scripts):
+        public = []
+        for key, script in scripts.items():
+            item = {field: _text(script[field]) for field in ("id", "label", "command", "source", "kind")}
+            item["cwd"] = _text(os.path.relpath(script["_cwd"], self.root))
+            item["executionCwd"] = _text(script["_cwd"])
+            for field in ("legacyConfig", "reviewRequired"):
+                if field in script:
+                    item[field] = script[field]
+            run = self._script_runs.get(key)
+            if run:
+                child = run["child"]
+                code = child.poll()
+                item.update(state="running" if code is None else "done" if code == 0 else "failed",
+                            pid=child.pid, exitCode=code, logFile=_text(run["logFile"]))
+            public.append(item)
+        return public
+
+    def _snapshot(self, include_candidates=False):
         with self._lock:
-            scripts, errors = self._load_scripts()
+            scripts, candidates, errors, revision = {}, {}, [], 0
+            try:
+                self._script_project()
+                scripts, candidates, errors, revision = self._load_scripts()
+            except (OSError, ProjectError) as error:
+                errors.append(_text(error))
             self._scripts = scripts
             errors.extend(message for key, message in self._script_failures.items() if key in scripts)
-            public = []
-            for key, script in scripts.items():
-                # Confirmation needs the entire command, never a display-width
-                # preview. _text sanitizes controls without truncating content.
-                item = {key: _text(script[key]) for key in ("id", "label", "command", "source", "kind")}
-                item["cwd"] = _text(script["_cwd"])
-                run = self._script_runs.get(key)
-                if run:
-                    child = run["child"]
-                    code = child.poll()
-                    item.update(state="running" if code is None else "done" if code == 0 else "failed",
-                                pid=child.pid, exitCode=code, logFile=_text(run["logFile"]))
-                public.append(item)
-            return {"scripts": public, "errors": errors}
+            snapshot = {"scripts": self._public_scripts(scripts), "errors": errors,
+                        "project": {"key": self.project_key, "root": self.root,
+                                    "config": str(self.config), "revision": revision}}
+            if include_candidates:
+                snapshot["candidates"] = self._public_scripts(candidates)
+            return snapshot
 
-    def add_script(self, name, command, replace=False):
-        name, command = self._validate_script(name, command)
+    def script_snapshot(self):
+        return self._snapshot()
+
+    def candidate_snapshot(self):
+        return self._snapshot(include_candidates=True)
+
+    def set_scripts(self, rows, expected_revision):
+        if not isinstance(rows, list) or len(rows) > 6:
+            raise ProjectError("精选命令必须为数组，最多 6 项")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ProjectError("expected_revision 必须为非负整数")
         with self._lock:
             if self._closed:
                 raise ProjectError("项目观察已关闭")
+            self._script_project()
+            scripts, names = [], set()
+            for row in rows:
+                if not isinstance(row, dict) or set(row) - {"name", "command", "cwd"}:
+                    raise ProjectError("精选命令条目只能包含 name、command、cwd")
+                name, command = self._validate_script(row.get("name"), row.get("command"))
+                if name in names:
+                    raise ProjectError("精选命令名称重复: " + name)
+                names.add(name)
+                relative, cwd = self._script_directory(row.get("cwd", "."))
+                self._validate_portable_command(command, cwd)
+                scripts.append({"name": name, "command": command, "cwd": relative})
             self.config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(self.config.parent, 0o700)
             os.chmod(self.config.parent.parent, 0o700)
-            lock_path = self.config.with_suffix(".lock")
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fd = os.open(self.config.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "a+b") as lock:
                 os.fchmod(lock.fileno(), 0o600)
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                scripts = self._custom_scripts()
-                existing = next((item for item in scripts if item["name"] == name), None)
-                if existing:
-                    if existing["command"] == command:
-                        return "已保存 " + _text(name)
-                    if not replace:
-                        raise ProjectError("已有同名项目命令；使用 replace 明确替换: " + name)
-                    existing["command"] = command
-                else:
-                    scripts.append({"name": name, "command": command})
+                current = self._curated_config()
+                if current["revision"] != expected_revision:
+                    raise ProjectError("项目命令 revision 已变化，请重新读取并复核")
                 fd, temporary = tempfile.mkstemp(prefix=".project-", dir=self.config.parent)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as stream:
                         os.fchmod(stream.fileno(), 0o600)
-                        json.dump({"v": 1, "cwd": self.cwd, "scripts": scripts}, stream, ensure_ascii=False)
+                        json.dump({"v": 2, "project": self.project_key,
+                                   "revision": expected_revision + 1, "scripts": scripts},
+                                  stream, ensure_ascii=False)
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.replace(temporary, self.config)
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
-        return "已添加 " + _text(name)
+            return self.script_snapshot()
 
     def run_script(self, id):
         with self._lock:
@@ -679,7 +854,8 @@ class ProjectState:
                 raise ProjectError("项目观察已关闭")
             if not isinstance(id, str) or id not in self._scripts:
                 raise ProjectError("命令不在当前项目快照中")
-            current, errors = self._load_scripts()
+            self._script_project()
+            current, _, errors, _ = self._load_scripts()
             if id not in current:
                 raise ProjectError("命令已变化，请刷新后重试" + (": " + "; ".join(errors) if errors else ""))
             script = current[id]
@@ -941,6 +1117,7 @@ class ProjectState:
         commands = self.script_snapshot()
         errors.extend(commands["errors"])
         snapshot["scripts"] = commands["scripts"]
+        snapshot["scriptProject"] = commands["project"]
         snapshot["editor"] = self.editor_info()
         try:
             snapshot["servers"], server_errors = self._servers()

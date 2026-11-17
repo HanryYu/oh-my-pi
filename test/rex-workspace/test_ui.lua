@@ -25,7 +25,7 @@ end
 local function contains(value, needle) assert(value:find(needle, 1, true), "missing " .. needle) end
 local function absent(value, needle) assert(not value:find(needle, 1, true), "unexpected " .. needle) end
 local function snapshot(git)
-    return {v = 1, main = {state = "working", intent = "实现工作区"}, project = {host = "mac", cwd = "/project", editor = {label = "Cursor", available = true}, git = git ~= false, branch = "main", changes = {added = 4, removed = 2, files = 1}, scripts = {}, servers = {}}, agents = {}}
+    return {v = 1, capabilities = {scriptCuration = true}, main = {state = "working", intent = "实现工作区"}, project = {host = "mac", cwd = "/project", editor = {label = "Cursor", available = true}, git = git ~= false, branch = "main", changes = {added = 4, removed = 2, files = 1}, scripts = {}, servers = {}}, agents = {}}
 end
 local function panel()
     local sent = {}
@@ -91,7 +91,7 @@ test("Empty groups and non-git controls stay absent, project actions remain reac
     eq(action_y(p, "toggle", "servers"), nil); eq(action_y(p, "toggle", "agents"), nil)
     eq(action_y(p, "open-editor"), nil)
     click(p, "open-terminal"); eq(sent[1].type, "open-terminal")
-    click(p, "add-script"); eq(p.input_kind, "script-name")
+    click(p, "curate-scripts"); eq(p.input_kind, nil); eq(sent[2].type, "curate-scripts")
 end)
 test("Activation requires same press and release, drag cancels", function()
     local p, sent = panel()
@@ -133,22 +133,55 @@ test("Collapsed groups support keyboard expansion, activation and return to pare
     local p, sent = panel()
     click(p, "toggle", "scripts")
     p:event("left"); p:render(36, 30)
-    eq(p.focus[2], "scripts"); eq(action_y(p, "add-script"), nil)
-    p:event("right"); p:event("down"); p:event("enter"); eq(p.input_kind, "script-name")
-    p:event("escape"); p:event("left"); p:render(36, 30); eq(p.focus[2], "scripts")
-    eq(action_y(p, "add-script"), nil)
-    p:event("enter"); p:render(36, 30); assert(action_y(p, "add-script"))
+    eq(p.focus[2], "scripts"); eq(action_y(p, "curate-scripts"), nil)
+    p:event("right"); p:event("down"); p:render(36, 30); eq(p.focus[1], "curate-scripts")
+    p:event("left"); p:render(36, 30); eq(p.focus[2], "scripts")
+    eq(action_y(p, "curate-scripts"), nil)
+    p:event("enter"); p:render(36, 30); assert(action_y(p, "curate-scripts"))
 end)
-test("Forms send only complete explicit submissions", function()
+test("Commit form sends only complete explicit submissions", function()
     local p, sent = panel()
-    click(p, "add-script"); p:event({"text", "dev"}); p:event("enter"); eq(#sent, 0)
-    p:event({"paste", "bun run dev\n"}); eq(#sent, 0)
+    click(p, "commit"); p:event("enter"); eq(#sent, 0); eq(p.notice_error, true)
+    p:event({"paste", "Implement workspace"}); eq(#sent, 0)
     p:event("escape"); eq(#sent, 0)
-    click(p, "add-script"); p:event({"paste", "开发"}); p:event("enter"); p:event({"paste", "bun run dev\n"}); p:event("enter")
-    eq(sent[1].type, "add-script"); eq(sent[1].name, "开发"); eq(sent[1].command, "bun run dev")
-    click(p, "commit"); p:event("enter"); eq(#sent, 1); eq(p.notice_error, true)
-    p:event({"paste", "Implement workspace"}); p:event("enter"); eq(sent[2].message, "Implement workspace")
+    click(p, "commit"); p:event({"paste", "Implement workspace"}); p:event("enter")
+    eq(sent[1].type, "commit"); eq(sent[1].message, "Implement workspace")
     eq(p.input_kind, nil)
+end)
+test("Add script sends once and stays disabled through queued and running updates", function()
+    local p, sent = panel(); local s = snapshot()
+    click(p, "curate-scripts"); eq(#sent, 1); eq(sent[1].type, "curate-scripts")
+    eq(p.input_kind, nil)
+    p:activate({"curate-scripts"}); eq(#sent, 1)
+    p:render(48, 30)
+    eq(action_y(p, "curate-scripts"), nil)
+    p:receive(s); p:render(48, 30); eq(action_y(p, "curate-scripts"), nil)
+    for _, phase in ipairs({"queued", "running"}) do
+        s.scriptCuration = {id = "selection", phase = phase}
+        p:receive(s); p:render(48, 30); p:activate({"curate-scripts"}); eq(#sent, 1)
+    end
+    s.scriptCuration.phase = "done"; p:receive(s); p:render(48, 30)
+    click(p, "curate-scripts"); eq(#sent, 2)
+    p:receive(s); p:render(48, 30); eq(action_y(p, "curate-scripts"), nil)
+    s.scriptCuration = {id = "next-selection", phase = "error", error = "Cannot inspect project"}
+    p:receive(s); p:render(48, 30)
+    assert(action_y(p, "curate-scripts"))
+end)
+test("Old sessions require a new session without manual or fake AI fallback", function()
+    local p, sent = panel(); local s = snapshot(); s.capabilities = nil
+    p:receive(s); p:render(60, 30)
+    eq(action_y(p, "curate-scripts"), nil)
+    p:activate({"curate-scripts"}); p:activate({"add-script"})
+    eq(#sent, 0); eq(p.input_kind, nil)
+end)
+test("Rejected requests clear pending and preserve the real error", function()
+    local p, sent = panel(); click(p, "curate-scripts")
+    local s = snapshot(); s.notice, s.noticeError = "Source has ended", true
+    p:receive(s); contains(text(p:render(48, 30)), "Source has ended")
+    assert(action_y(p, "curate-scripts")); eq(#sent, 1)
+    local failed = Panel.new(function() return false end)
+    failed:receive(snapshot()); failed:render(48, 30); click(failed, "curate-scripts")
+    failed:render(48, 30); assert(action_y(failed, "curate-scripts"))
 end)
 test("Real project ids and registry generation are routed", function()
     local p, sent = panel(); local s = snapshot()
@@ -195,6 +228,19 @@ test("Commands require confirmation and stale previews cannot execute", function
     eq(#sent, 0); eq(p.notice_error, true)
     click(p, "run-script", "dev"); p:event("enter"); eq(sent[1].id, "dev")
 end)
+test("Run confirmation shows the checkout execution directory with legacy fallback", function()
+    local p, sent = panel(); local s = snapshot()
+    s.project.scripts = {{id = "build", label = "Build", command = "bun run build",
+        cwd = ".", executionCwd = "/worktree/current"}}
+    p:receive(s); click(p, "run-script", "build")
+    contains(text(p:render(48, 30)), "/worktree/current")
+    eq(p.pending_script.cwd, "/worktree/current"); eq(#sent, 0)
+    p:event("escape")
+    s.project.scripts[1].executionCwd, s.project.scripts[1].cwd = nil, "/legacy/checkout"
+    p:receive(s); click(p, "run-script", "build")
+    contains(text(p:render(48, 30)), "/legacy/checkout")
+    eq(p.pending_script.cwd, "/legacy/checkout"); eq(#sent, 0)
+end)
 test("Running commands expose actual state but cannot be launched twice", function()
     local p, sent = panel(); local s = snapshot()
     s.project.scripts = {{id = "dev", label = "dev", command = "bun run dev", state = "running", pid = 42, logFile = "/logs/dev.log"}}
@@ -203,15 +249,24 @@ test("Running commands expose actual state but cannot be launched twice", functi
     p:event("escape"); s.project.scripts[1].state = "done"; p:receive(s)
     click(p, "run-script", "dev"); p:event("enter"); eq(sent[1].id, "dev")
 end)
-test("Preferred workflows stay visible and other scripts remain reachable", function()
+test("Curated order is preserved, capped at six, and candidates never appear", function()
     local p, sent = panel(); local s = snapshot()
-    for i = 1, 12 do s.project.scripts[#s.project.scripts + 1] = {id = "task-" .. i, label = "task-" .. i, kind = "task", command = "echo task"} end
-    for _, kind in ipairs({"dev", "build", "test", "check"}) do s.project.scripts[#s.project.scripts + 1] = {id = kind, label = kind, kind = kind, command = "echo " .. kind} end
-    p:receive(s); p:render(36, 40)
-    for _, kind in ipairs({"dev", "build", "test", "check"}) do assert(action_y(p, "run-script", kind)) end
-    eq(action_y(p, "run-script", "task-12"), nil)
-    click(p, "toggle", "more-scripts"); click(p, "run-script", "task-12")
-    eq(#sent, 0); p:event("enter"); eq(sent[1].id, "task-12")
+    for i = 1, 8 do
+        s.project.scripts[#s.project.scripts + 1] = {
+            id = "task-" .. i, label = "chosen-" .. i, kind = i == 8 and "dev" or "task",
+            state = i == 8 and "running" or nil, command = "echo task"}
+    end
+    s.project.candidates = {{id = "candidate", label = "Unselected candidate", command = "echo candidate"}}
+    p:receive(s); local out = text(p:render(48, 40))
+    local previous = 0
+    for i = 1, 6 do
+        local y = assert(action_y(p, "run-script", "task-" .. i)); assert(y > previous); previous = y
+    end
+    eq(action_y(p, "run-script", "task-7"), nil); eq(action_y(p, "run-script", "task-8"), nil)
+    eq(action_y(p, "toggle", "more-scripts"), nil)
+    absent(out, "More scripts"); absent(out, "Unselected candidate")
+    click(p, "run-script", "task-6"); eq(#sent, 0)
+    p:event("enter"); eq(sent[1].id, "task-6")
 end)
 test("Long command previews are scrollable in a narrow sidebar", function()
     local p, sent = panel(); local s = snapshot()

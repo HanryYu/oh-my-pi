@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest import mock
 
 HERE = Path(__file__).resolve().parents[2] / "packages/coding-agent/rex-workspace"
@@ -203,6 +204,96 @@ class SecurityTests(Fixture):
         self.assertFalse((self.root / "control.sock").exists())
 
 
+    def test_curation_mailbox_binds_live_source_and_is_private_exclusive_atomic(self):
+        self.source[1]["capabilities"] = {"scriptCuration": True}
+        self.save()
+        self.watcher.scan()
+        # Bind to the current native task even before the next observer scan.
+        self.source[1]["taskId"] = "latest-task"
+        self.save()
+        with mock.patch.object(worker.subprocess, "Popen", side_effect=AssertionError("must not execute")):
+            self.watcher.command({"type": "curate-scripts", "root": str(self.root)})
+        path = self.root / "curation-request.json"
+        request = worker.read_json(path)
+        self.assertEqual(request, {"v": 1, "type": "curate-scripts", "id": request["id"],
+                                  "pid": os.getpid(), "sessionId": "main-session", "anchor": "anchor",
+                                  "cwd": str(self.repo), "taskId": "latest-task"})
+        self.assertEqual(str(uuid.UUID(request["id"])), request["id"])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(path.stat().st_nlink, 1)
+        self.assertEqual(list(self.root.glob(".publish-*")), [])
+        original = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.watcher.command({"type": "curate-scripts", "root": str(self.root)})
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_curation_rejects_old_closed_pending_and_changed_sources(self):
+        self.watcher.scan()
+        command = {"type": "curate-scripts", "root": str(self.root)}
+        with self.assertRaisesRegex(ValueError, "new OMP session"):
+            self.watcher.command(command)
+        self.source[1]["capabilities"] = {"scriptCuration": True}
+        for phase in ("queued", "running"):
+            self.source[1]["scriptCuration"] = {"id": "existing", "phase": phase}
+            self.save()
+            with self.assertRaisesRegex(ValueError, "already pending"):
+                self.watcher.command(command)
+        self.source[1]["scriptCuration"] = {"id": "existing", "phase": "done"}
+        self.source[1]["closed"] = True
+        self.save()
+        with self.assertRaisesRegex(ValueError, "ended"):
+            self.watcher.command(command)
+        self.source[1]["closed"] = False
+        self.source[1]["sessionId"] = "replacement"
+        self.save()
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            self.watcher.command(command)
+        self.assertFalse((self.root / "curation-request.json").exists())
+
+    def test_curation_rejects_unsafe_roots_sources_and_existing_mailbox_targets(self):
+        self.source[1]["capabilities"] = {"scriptCuration": True}
+        self.save()
+        outside = self.base / "outside-curation"
+        private_write(outside, b"unchanged")
+        mailbox = self.root / "curation-request.json"
+        mailbox.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            worker.request_script_curation(self.root)
+        self.assertEqual(outside.read_bytes(), b"unchanged")
+        mailbox.unlink()
+        private_write(mailbox, {})
+        mailbox.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            worker.request_script_curation(self.root)
+        self.assertEqual(stat.S_IMODE(mailbox.stat().st_mode), 0o644)
+        mailbox.unlink()
+        alias = self.base / self.root.name
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            worker.request_script_curation(alias)
+        self.root.chmod(0o755)
+        with self.assertRaises(ValueError):
+            worker.request_script_curation(self.root)
+        self.root.chmod(0o700)
+        (self.root / "root.json").chmod(0o644)
+        with self.assertRaises(ValueError):
+            worker.request_script_curation(self.root)
+        self.assertFalse(mailbox.exists())
+
+    def test_curation_atomic_publication_does_not_overwrite_a_racing_request(self):
+        self.source[1]["capabilities"] = {"scriptCuration": True}
+        self.save()
+        mailbox = self.root / "curation-request.json"
+        link = worker.os.link
+        def competing_link(source, destination, **kwargs):
+            private_write(mailbox, {"id": "winner"})
+            return link(source, destination, **kwargs)
+        with mock.patch.object(worker.os, "link", side_effect=competing_link):
+            with self.assertRaises(FileExistsError):
+                worker.request_script_curation(self.root)
+        self.assertEqual(worker.read_json(mailbox), {"id": "winner"})
+        self.assertEqual(list(self.root.glob(".publish-*")), [])
+
     def test_publish_names_private_atomic_replacement_and_unknown_root(self):
         self.watcher.scan()
         outside = self.base / "outside"
@@ -212,7 +303,7 @@ class SecurityTests(Fixture):
         self.assertEqual(outside.read_bytes(), b"untouched")
         self.assertFalse((self.root / "view.json").is_symlink())
         self.assertEqual(stat.S_IMODE((self.root / "view.json").stat().st_mode), 0o600)
-        for name in ("../other", "root.json", "control.sock"):
+        for name in ("../other", "root.json", "control.sock", "../curation-request.json", "nested/curation-request.json"):
             with self.assertRaises(ValueError):
                 self.watcher.command({"type": "publish", "root": str(self.root), "name": name, "data": {}})
         with self.assertRaises(ValueError):
@@ -294,6 +385,19 @@ class SecurityTests(Fixture):
 
 
 class ProjectWorkerTests(Fixture):
+    def test_model_config_home_keeps_curated_commands_visible_to_a_different_observer_environment(self):
+        model_config = self.base / "model-config"
+        self.source[1]["configHome"] = str(model_config)
+        self.save()
+        saved = subprocess.run(
+            [sys.executable, str(HERE / "worker.py"), "scripts", "--cwd", str(self.repo), "set", "--revision", "0"],
+            input=json.dumps({"scripts": [{"name": "Build", "command": "printf build"}]}).encode(),
+            env=dict(os.environ, XDG_CONFIG_HOME=str(model_config)), capture_output=True)
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        slot = self.observe()
+        self.assertEqual([row["label"] for row in slot.snapshot["scripts"]], ["Build"])
+        self.assertEqual(slot.snapshot["scriptProject"]["config"], json.loads(saved.stdout)["project"]["config"])
+
     def test_large_real_diff_explicitly_marks_display_truncation(self):
         self.repository()
         (self.repo / "tracked").write_text("x" * 140000 + "\nUNSEEN-TAIL\n")
@@ -324,12 +428,14 @@ class ProjectWorkerTests(Fixture):
         self.assertEqual((self.repo / "tracked").read_text(), "working\n")
         self.assertEqual(self.git("log", "-1", "--format=%s").strip(), b"explicit message")
 
-    def test_add_and_run_script_are_explicit_validated_and_survive_forget(self):
+    def test_curated_script_execution_is_explicit_validated_and_survives_forget(self):
         slot = self.observe()
         marker = self.repo / "ran"
-        command = "printf explicit > " + shlex.quote(str(marker))
-        self.assertNotIn("error", self.action({"type": "add-script", "name": "Write", "command": command}))
+        command = "printf explicit > ran"
+        revision = slot.project.script_snapshot()["project"]["revision"]
+        slot.project.set_scripts([{"name": "Write", "command": command}], revision)
         self.assertFalse(marker.exists())
+        slot.refresh_at = 0
         self.pump(lambda: bool(slot.snapshot.get("scripts")))
         identity = slot.snapshot["scripts"][0]["id"]
         with self.assertRaises(ValueError):
@@ -347,8 +453,9 @@ class ProjectWorkerTests(Fixture):
         self.observe()
         response = self.action({"type": "commit", "message": ""})
         self.assertTrue(response["error"])
-        response = self.action({"type": "add-script", "name": "", "command": "true"})
-        self.assertTrue(response["error"])
+        with self.assertRaisesRegex(ValueError, "unknown project action"):
+            self.watcher.command({"type": "project", "root": str(self.root),
+                                  "request": {"type": "add-script", "name": "Write", "command": "true"}})
         self.watcher.command({"type": "publish", "root": str(self.root), "name": "view.json", "data": {"alive": True}})
         self.assertTrue(worker.read_json(self.root / "view.json")["alive"])
 
@@ -392,11 +499,13 @@ class ProjectWorkerTests(Fixture):
         slot = self.watcher.roots[str(self.root)]["project"]
         marker = self.repo / "listener.json"
         code = ("import os,socket,time,json; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); "
-                "open(%r,'w').write(json.dumps([os.getpid(),s.getsockname()[1]])); time.sleep(30)" % str(marker))
+                "open('listener.json','w').write(json.dumps([os.getpid(),s.getsockname()[1]])); time.sleep(30)")
         with mock.patch.object(slot.project, "_supervisor_rows", return_value=([], None)):
             self.pump(lambda: bool(slot.snapshot))
             command = "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(code)
-            self.action({"type": "add-script", "name": "Listener", "command": command})
+            revision = slot.project.script_snapshot()["project"]["revision"]
+            slot.project.set_scripts([{"name": "Listener", "command": command}], revision)
+            slot.refresh_at = 0
             self.pump(lambda: bool(slot.snapshot.get("scripts")))
             identity = slot.snapshot["scripts"][0]["id"]
             self.action({"type": "run-script", "id": identity})
@@ -466,6 +575,68 @@ class CliTests(Fixture):
     def cli(self, *args, input=None):
         return subprocess.run([sys.executable, str(HERE / "worker.py"), *args], input=input,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+
+    def test_script_cli_lists_curated_only_and_discovers_without_execution(self):
+        marker = self.repo / "not-executed"
+        (self.repo / "package.json").write_text(json.dumps({"scripts": {"build": "touch " + str(marker)}}))
+        listed = self.cli("scripts", "--cwd", str(self.repo), "list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        empty = json.loads(listed.stdout)
+        self.assertEqual(empty["scripts"], [])
+        self.assertIn("revision", empty["project"])
+        discovered = self.cli("scripts", "--cwd", str(self.repo), "discover")
+        self.assertEqual(discovered.returncode, 0, discovered.stderr)
+        candidates = json.loads(discovered.stdout)
+        self.assertEqual(candidates["scripts"], [])
+        self.assertTrue(any(row["label"] == "build" for row in candidates["candidates"]))
+        self.assertIn("errors", candidates)
+        self.assertFalse(marker.exists())
+
+    def test_script_cli_set_reads_json_and_rejects_stale_or_invalid_revision(self):
+        (self.repo / "tools").mkdir()
+        listed = self.cli("scripts", "--cwd", str(self.repo), "list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        revision = json.loads(listed.stdout)["project"]["revision"]
+        rows = [{"name": "Build", "command": "printf selected", "cwd": "tools"}]
+        saved = self.cli("scripts", "--cwd", str(self.repo), "set", "--revision", str(revision),
+                         input=json.dumps({"scripts": rows}).encode())
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        snapshot = json.loads(saved.stdout)
+        self.assertEqual([row["label"] for row in snapshot["scripts"]], ["Build"])
+        self.assertEqual(snapshot["scripts"][0]["cwd"], "tools")
+        self.assertEqual(snapshot["scripts"][0]["executionCwd"], str(self.repo / "tools"))
+        self.assertGreater(snapshot["project"]["revision"], revision)
+        stale = self.cli("scripts", "--cwd", str(self.repo), "set", "--revision", str(revision),
+                         input=b'{"scripts":[]}')
+        self.assertNotEqual(stale.returncode, 0)
+        current = snapshot["project"]["revision"]
+        for invalid in ("-1", "not-an-integer"):
+            result = self.cli("scripts", "--cwd", str(self.repo), "set", "--revision", invalid,
+                              input=b'{"scripts":[]}')
+            self.assertNotEqual(result.returncode, 0)
+        result = self.cli("scripts", "--cwd", str(self.repo), "list")
+        self.assertEqual(json.loads(result.stdout)["project"]["revision"], current)
+        self.assertEqual(len(json.loads(result.stdout)["scripts"]), 1)
+        cleared = self.cli("scripts", "--cwd", str(self.repo), "set", "--revision", str(current),
+                           input=b'{"scripts":[]}')
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(json.loads(cleared.stdout)["scripts"], [])
+
+    def test_script_cli_rejects_bad_json_rows_and_removed_add_command(self):
+        listed = self.cli("scripts", "--cwd", str(self.repo), "list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        revision = str(json.loads(listed.stdout)["project"]["revision"])
+        for payload in (b"not-json", b"[]", b"{}", b'{"scripts":{}}', b'{"scripts":[],"extra":true}',
+                        b'{"scripts":[{"name":"Build","command":"true","cwd":"../outside"}]}',
+                        b'{"scripts":[{"name":"Build","command":false}]}',
+                        json.dumps({"scripts": [{"name": "Task " + str(i), "command": "true"} for i in range(7)]}).encode(),
+                        b"x" * (worker.FRAME_LIMIT + 1)):
+            result = self.cli("scripts", "--cwd", str(self.repo), "set", "--revision", revision, input=payload)
+            self.assertNotEqual(result.returncode, 0, payload[:100])
+        removed = self.cli("scripts", "--cwd", str(self.repo), "add", "--name", "Build", "--command", "true")
+        self.assertNotEqual(removed.returncode, 0)
+        result = self.cli("scripts", "--cwd", str(self.repo), "list")
+        self.assertEqual(json.loads(result.stdout)["scripts"], [])
 
     def test_malformed_and_oversized_stdin_do_not_poison_following_commands(self):
         daemon = Daemon(self)

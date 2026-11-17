@@ -14,11 +14,17 @@ local statuses = {working = "running", idle = "done", completed = "done", failed
 function M.new(send)
     local self = {
         send = send, snapshot = {}, offset = 0, rows = {}, hits = {}, height = 24, width = 79,
-        notice = "", input = ui.input(), collapsed = {["more-scripts"] = true}, keyboard = false,
+        notice = "", input = ui.input(), collapsed = {}, keyboard = false,
     }
     function self:receive(snapshot)
         self.snapshot = snapshot
         local notice, is_error = ui.field(snapshot, "notice", "", 1000), snapshot.noticeError == true
+        local curation = snapshot.scriptCuration or {}
+        if self.curation_pending and ((curation.phase == "done" or curation.phase == "error")
+                and curation.id ~= self.curation_before
+                or is_error and (notice ~= self.remote_notice or is_error ~= self.remote_error)) then
+            self.curation_pending = nil
+        end
         if notice ~= self.remote_notice or is_error ~= self.remote_error then
             if notice ~= "" or not self.input_kind then self.notice, self.notice_error = notice, is_error end
             self.remote_notice, self.remote_error = notice, is_error
@@ -104,19 +110,11 @@ function M.new(send)
                 if item.selected then item[2] = "accent" end
             end
         end
-        local scripts, preferred, used = {}, {}, {}
+        local scripts = {}
         for _, script in ipairs(project.scripts or {}) do
+            if #scripts >= 6 then break end
             if type(script) == "table" and type(script.id) == "string" then scripts[#scripts + 1] = script end
         end
-        local function take(script)
-            if #preferred < 4 and not used[script.id] then preferred[#preferred + 1], used[script.id] = script, true end
-        end
-        for _, script in ipairs(scripts) do if script.state == "running" then take(script) end end
-        for _, script in ipairs(scripts) do if script.id:match("^user%-") then take(script) end end
-        for _, kind in ipairs({"dev", "build", "test", "check"}) do
-            for _, script in ipairs(scripts) do if script.kind == kind and not used[script.id] then take(script); break end end
-        end
-        for _, script in ipairs(scripts) do take(script) end
         local function script_row(script)
             local label = ui.field(script, "label", script.id)
             add((script.state == "running" and "" or "Run ") .. label,
@@ -124,11 +122,23 @@ function M.new(send)
                 script.state and ui.field(script, "state", "") or nil)
         end
         if group("scripts", "Scripts", #scripts > 0 and #scripts or nil) then
-            for _, script in ipairs(preferred) do script_row(script) end
-            if #scripts > #preferred and group("more-scripts", "More scripts", #scripts - #preferred) then
-                for _, script in ipairs(scripts) do if not used[script.id] then script_row(script) end end
+            for _, script in ipairs(scripts) do script_row(script) end
+            local curation = s.scriptCuration or {}
+            local pending = self.curation_pending or curation.phase == "queued" or curation.phase == "running"
+            if pending then
+                add("Selecting scripts…", "muted", nil, "curate-scripts")
+            elseif (s.capabilities or {}).scriptCuration == true then
+                add("Add script", "accent", {"curate-scripts"}, "curate-scripts")
+            else
+                for i, line in ipairs(ui.wrap("Start a new OMP session to add scripts", math.max(1, self.width))) do
+                    add(line, "muted", nil, "curate-scripts:" .. i)
+                end
             end
-            add("Add script", "accent", {"add-script"}, "add-script")
+            if curation.phase == "error" and type(curation.error) == "string" then
+                for i, line in ipairs(ui.wrap(ui.sanitize(curation.error, true), math.max(1, self.width))) do
+                    add(line, "error", nil, "curation-error:" .. i)
+                end
+            end
         end
         local servers = {}
         for _, server in ipairs(project.servers or {}) do
@@ -206,8 +216,7 @@ function M.new(send)
             local current = self.pending_script and self:script(self.pending_script.id)
             out[#out + 1] = row(fit(current and current.state == "running" and "Esc Back" or "Enter Run · Esc Cancel", self.width), "accent")
         elseif self.input_kind and #out < self.height then
-            local labels = {["script-name"] = "Name", ["script-command"] = "Command", commit = "Commit staged"}
-            local label = fit(labels[self.input_kind], math.max(0, self.width - 4)) .. " › "
+            local label = fit("Commit staged", math.max(0, self.width - 4)) .. " › "
             out[#out + 1] = row(fit(label .. self.input:display(math.max(1, self.width - ui.width(label))), self.width), "accent")
         end
         return out
@@ -229,11 +238,13 @@ function M.new(send)
             local script = self:script(action[2])
             if not script then return end
             self.pending_script = {id = script.id, label = script.label, command = script.command,
-                cwd = script.cwd, source = script.source, offset = self.offset}
+                cwd = script.executionCwd or script.cwd, source = script.source, offset = self.offset}
             self.input_kind, self.offset, self.focus, self.press = "run-script", 0, nil, nil
-        elseif kind == "add-script" or kind == "commit" then
-            self.input_kind = kind == "add-script" and "script-name" or "commit"
-            self.input, self.script_name = ui.input(), ""
+        elseif kind == "curate-scripts" then
+            self.curation_pending, self.curation_before = true, (self.snapshot.scriptCuration or {}).id
+            if self.send({type = kind}) == false then self.curation_pending = nil end
+        elseif kind == "commit" then
+            self.input_kind, self.input = "commit", ui.input()
         else
             local event = {type = kind}
             if action[2] then event[kind == "select" and "key" or "id"] = action[2] end
@@ -257,16 +268,12 @@ function M.new(send)
         end
         local value = self.input:value():match("^%s*(.-)%s*$")
         if value == "" then
-            self.notice = self.input_kind == "script-name" and "输入名称" or self.input_kind == "script-command" and "输入命令" or "输入提交信息"
+            self.notice = "输入提交信息"
             self.notice_error = true
             return
         end
-        if self.input_kind == "script-name" then
-            self.script_name, self.input_kind, self.input, self.notice, self.notice_error = value, "script-command", ui.input(), "", false
-            return
-        end
-        local event = self.input_kind == "script-command" and {type = "add-script", name = self.script_name, command = value} or {type = "commit", message = value}
-        self.input_kind, self.input, self.script_name, self.notice, self.notice_error = nil, ui.input(), "", "", false
+        local event = {type = "commit", message = value}
+        self.input_kind, self.input, self.notice, self.notice_error = nil, ui.input(), "", false
         self.send(event)
     end
     function self:move(amount)
@@ -286,7 +293,7 @@ function M.new(send)
         if self.input_kind then
             if event == "escape" then
                 local pending = self.pending_script
-                self.input_kind, self.pending_script, self.input, self.script_name, self.notice, self.notice_error, self.press = nil, nil, ui.input(), "", "", false, nil
+                self.input_kind, self.pending_script, self.input, self.notice, self.notice_error, self.press = nil, nil, ui.input(), "", false, nil
                 if pending then self.offset, self.focus = pending.offset or 0, {"run-script", pending.id} end
             elseif event == "enter" then self:submit()
             elseif self.input_kind == "run-script" then
@@ -297,7 +304,7 @@ function M.new(send)
                 elseif type(event) == "table" and event[1] == "mouse" and event[2] >= 64 and event[2] < 128 then
                     self.offset = math.max(0, self.offset + (event[2] % 2 == 1 and 3 or -3))
                 end
-            else self.input:event(event, self.input_kind == "script-name" and 160 or 4096) end
+            else self.input:event(event, 4096) end
             return true
         end
         local key = type(event) == "table" and event[1] == "text" and event[2] or event
@@ -353,6 +360,7 @@ if not (rex.args and rex.args.library) then
     panel = M.new(function(event)
         local ok, err = ui.request(module, root, "panel", event)
         if not ok then panel.notice, panel.notice_error = ui.sanitize(err, true), true end
+        return ok
     end)
     ui.run(panel, {root = root, mouse = true})
 end

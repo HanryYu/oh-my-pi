@@ -1,9 +1,11 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { getAgentDir, tryAcquireFileLock } from "@oh-my-pi/pi-utils";
+import { getAgentDir, prompt, tryAcquireFileLock } from "@oh-my-pi/pi-utils";
 import type { ExtensionAPI, ExtensionContext } from "../extensibility/extensions/types";
+import curateProjectScripts from "../prompts/rex/curate-project-scripts.md" with { type: "text" };
 import type { AgentRef, AgentRegistryApi } from "../registry/agent-registry";
 
 type NativeAssistant = Extract<AgentMessage, { role: "assistant" }>;
@@ -20,6 +22,9 @@ type State = "idle" | "working" | "done" | "blocked" | "error";
 type Identity = { id: string; key: string; kind: string; sessionId: string; sessionFile?: string; artifactsDir?: string };
 type Child = { key: string; id: string; sessionFile?: string; parentToolCallId?: string; taskId?: string; observedTaskId?: string };
 type Source = { v: 1; source: Identity; tools: Record<string, string>; children: Child[] };
+type ScriptCuration = { id: string; phase: "queued" | "running" | "done" | "error"; error?: string };
+type CurationRequest = { v: number; type: string; id: string; pid: number; sessionId: string;
+	anchor: string; cwd: string; taskId: string };
 
 function digest(value: string): string {
 	return crypto.createHash("sha256").update(value).digest("hex").slice(0, 24);
@@ -70,12 +75,16 @@ function publish(name: string, data: unknown): void {
 	fs.writeFileSync(temporary, JSON.stringify(data), { mode: 0o600, flag: "wx" });
 	fs.renameSync(temporary, target);
 }
-function readPrivate<T>(name: string): T | undefined {
+function readPrivate<T>(name: string, maxBytes?: number): T | undefined {
 	let fd: number | undefined;
 	try {
 		fd = fs.openSync(path.join(privateDirectory(), name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
 		const info = fs.fstatSync(fd);
-		if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077)) return undefined;
+		if (!info.isFile() || info.uid !== process.getuid?.() || (info.mode & 0o077) ||
+			maxBytes !== undefined && info.size > maxBytes) {
+			if (maxBytes !== undefined) throw new Error("工作区请求不是受信任的私有文件");
+			return undefined;
+		}
 		return JSON.parse(fs.readFileSync(fd, "utf8")) as T;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -342,8 +351,10 @@ class Workspace {
 	#snapshot = "";
 	#executable = ompExecutable();
 	#diagnostics: Array<{ agentId: string; code: string; message: string }> = [];
+	#curation?: ScriptCuration;
+	#curationTask?: string;
 
-	constructor(private ctx: ExtensionContext, pi: ExtensionAPI, private warn: (message: string) => void, width: number, private agentDir: string) {
+	constructor(private ctx: ExtensionContext, private pi: ExtensionAPI, private warn: (message: string) => void, width: number, private agentDir: string) {
 		this.sessionId = ctx.sessionManager.getSessionId();
 		this.#display = { action: "hide", seq: 0, width };
 		this.#registry = pi.pi.AgentRegistry.global();
@@ -363,6 +374,15 @@ class Workspace {
 		if (!userTask(message) || this.#seenMessages.has(message)) return;
 		this.#seenMessages.add(message);
 		this.taskId = crypto.randomUUID();
+		const text = message.role === "user" ? typeof message.content === "string" ? message.content :
+			message.content.map(part => part.type === "text" ? part.text : "").join("\n") : "";
+		if (this.#curation?.phase === "queued" &&
+			text.startsWith(`<!-- rex-script-curation:${this.#curation.id} -->`)) {
+			this.#curation = { id: this.#curation.id, phase: "running" };
+			this.#curationTask = this.taskId;
+		} else if (this.#curation?.phase === "running") {
+			this.#curation = { id: this.#curation.id, phase: "error", error: "Script selection was superseded by a new request." };
+		}
 		this.#accepting = true;
 		this.#members.clear();
 		this.#tools.clear();
@@ -439,8 +459,56 @@ class Workspace {
 		return result;
 	}
 
+	#pollCuration(): void {
+		if (this.#closed) return;
+		const name = "curation-request.json";
+		let request: CurationRequest | undefined;
+		let file: string | undefined;
+		try {
+			file = path.join(privateDirectory(), name);
+			request = readPrivate<CurationRequest>(name, 16_384);
+			if (request === undefined) return;
+			fs.unlinkSync(file);
+			file = undefined;
+			if (!request || typeof request !== "object") throw new Error("Invalid script selection request.");
+			if (this.#curation && request.id === this.#curation.id) return;
+			if (this.#curation?.phase === "queued" || this.#curation?.phase === "running") {
+				this.warn("脚本筛选已在处理中；未重复启动 AI");
+				return;
+			}
+			if (request.v !== 1 || request.type !== "curate-scripts" ||
+				typeof request.id !== "string" || !/^[0-9a-f-]{36}$/.test(request.id) ||
+				request.pid !== process.pid || request.sessionId !== this.sessionId ||
+				request.anchor !== process.env.REX_BLOCK || typeof request.cwd !== "string" ||
+				canonical(request.cwd) !== canonical(this.ctx.cwd)) {
+				throw new Error("Script selection request no longer belongs to this session and project.");
+			}
+			this.#curation = { id: request.id, phase: "queued" };
+			this.#curationTask = undefined;
+			const content = prompt.render(curateProjectScripts, { id: request.id,
+				request: JSON.stringify({ id: request.id, cwd: this.ctx.cwd,
+					worker: path.resolve(import.meta.dir, "../../rex-workspace/worker.py") }, null, 2) });
+			const id = request.id;
+			void this.pi.sendUserMessage(content, { attribution: "user",
+				...(this.ctx.isIdle() ? {} : { deliverAs: "followUp" as const }) }).catch(error => {
+				if (this.#closed || this.#curation?.id !== id) return;
+				this.#curation = { id, phase: "error", error: String(error) };
+				this.flush();
+			});
+		} catch (error) {
+			if (file) {
+				try { fs.unlinkSync(file); }
+				catch (cleanup) {
+					if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") this.warn(String(cleanup));
+				}
+			}
+			this.#curation = { id: request?.id || crypto.randomUUID(), phase: "error", error: String(error) };
+		}
+	}
+
 	flush(): void {
 		try {
+			this.#pollCuration();
 			this.#main.title = this.ctx.sessionManager.getSessionName();
 			const agents = this.#agents();
 			const snapshot = JSON.stringify({ v: 3, pid: process.pid, session: process.env.REX_SESSION,
@@ -448,8 +516,11 @@ class Workspace {
 				sessionFile: canonical(this.ctx.sessionManager.getSessionFile()),
 				ompExecutable: this.#executable,
 				agentDir: canonical(this.agentDir),
+				configHome: canonical(process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME) ?
+					process.env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config")),
 				commandPath: (process.env.PATH || "").split(":").filter(part => path.isAbsolute(part)).join(":"),
 				taskId: this.taskId, main: this.#main, agents, diagnostics: this.#diagnostics,
+				capabilities: { scriptCuration: true }, scriptCuration: this.#curation,
 				closed: this.#closed, display: this.#display });
 			if (snapshot === this.#snapshot) return;
 			publish("root.json", JSON.parse(snapshot));
@@ -494,6 +565,11 @@ class Workspace {
 		this.#main.state = willContinue || awaitingAsyncWork ? "working" :
 			last?.role !== "assistant" || last.stopReason === "aborted" ? "idle" : last.stopReason === "error" ? "error" : "done";
 		this.#main.intent = awaitingAsyncWork ? "等待后台任务" : "";
+		if (this.#curation?.phase === "running" && this.#curationTask === this.taskId && !willContinue && !awaitingAsyncWork) {
+			const failed = last?.role !== "assistant" || last.stopReason === "error" || last.stopReason === "aborted";
+			this.#curation = { id: this.#curation.id, phase: failed ? "error" : "done",
+				...(failed ? { error: "Script selection did not complete." } : {}) };
+		}
 		this.flush();
 	}
 	finish(): void {

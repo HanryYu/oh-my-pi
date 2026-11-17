@@ -13,11 +13,13 @@ rex-omp
 
 在 Rex 中新开 `rex-omp` 会话生效，不会重启现有对话。默认左侧对话占 80%、右侧占 20%，`REX_WORKSPACE_WIDTH` 可设为 15–35 的整数。点击子 agent 才打开唯一的右下详情，切换时复用；新用户任务清空历史列表，选中的 agent 被销毁后收起详情。
 
-侧栏提供已检测到的 GUI 编辑器、可复用的项目终端、Git 改动、当前任务子 agent、脚本及实际监听的服务。常用开发/构建/测试/检查命令直接可见，其余脚本可展开。点击脚本查看完整命令和工作目录，按 Enter 才执行；运行状态来自真实进程。隐藏侧栏不停止脚本，也不关闭项目终端。
+侧栏提供已检测到的 GUI 编辑器、可复用的项目终端、Git 改动、当前任务子 agent、精选脚本及实际监听的服务。点击脚本查看完整命令和当前 worktree 工作目录，按 Enter 才执行；运行状态来自真实进程。隐藏侧栏不停止脚本，也不关闭项目终端。
 
-命令从 package scripts 和 lockfile、受支持的 `.claude/launch.json` 进程定义、Make target 及无必填参数的 Just recipe 中静态发现，不执行项目命令。内置 [`rex-omp-workspace` skill](packages/coding-agent/rex-workspace/skills/rex-omp-workspace/SKILL.md) 指导 agent 复用已有命令，并通过私有 CLI 登记经项目配置确认的缺失工作流。发现和保存不会启动服务；不冒充 Claude Desktop 的内嵌浏览器、自动验证或 `autoPort`。
+**Add script** 把请求交给当前 OMP 会话的 AI：检查项目配置和真实脚本内容，调整调用方式，只保存重要命令，通常 3–5 项、最多 6 项。package/launch/Make/Just 配置及项目脚本目录的静态发现只提供候选，不再自动塞入侧栏。内置 [`rex-omp-workspace` skill](packages/coding-agent/rex-workspace/skills/rex-omp-workspace/SKILL.md) 说明 `scripts discover`、`list` 及带 revision 检查的 `set`。发现和保存不会执行脚本。
 
-项目及 package 根目录、`scripts/`、`script/`、`bin/`、`tools/` 内的已有脚本也会在限定深度内静态发现，随文件新增、删除自动同步，内容改变后旧执行 ID 失效。已有配置直接调用同一脚本时，优先保留配置入口，避免重复。执行前需检查参数和工作目录要求；超出自动发现范围或需要参数的脚本，由 skill 指导登记完整调用命令。
+私有配置按 Git common directory 标识项目，同仓库所有 worktree 共享；命令相对当前 checkout 执行，并发修改会报冲突而不是静默覆盖。旧私有命令保留为待复核候选，脚本内容变化会使旧执行 ID 失效。
+
+只有主动请求 AI 筛选会消耗模型 token；布局、agent、Git 和服务观察不调用模型。忙碌会话会把筛选排在当前任务之后。更新后需新开 `rex-omp` 对话启用原生 AI 入口，不向旧会话注入补丁。面板在 GUI 挂载后再次校正比例，不持续抢回用户后续手动拖动的宽度；不冒充 Claude Desktop 的内嵌浏览器、自动验证或 `autoPort`。
 
 安装需要 macOS、Python 3.9+、Git、Rex 和 `lsof`。安装器准备私有 Bun 与匹配的官方 native binding，不替换 Homebrew 的 `omp`、升级全局 Bun 或修改账号、输入框、主题及全局 OMP 设置。fork 加载扩展时会排除已退役的 `rex-subagent-viewer`，但保留其文件给官方版及配置同步的其他机器使用。
 
