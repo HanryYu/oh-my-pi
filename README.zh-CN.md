@@ -35,7 +35,7 @@ rex-omp update
 rex-omp rollback
 ```
 
-从不含路径接收器的旧版首次升级时，在规范源码目录执行 `git pull --ff-only`，再运行 `python3 scripts/rex.py update` 引导一次。安装清单 v2 会让旧升级器明确拒绝不完整候选，避免生成新链接却没有接收器；之后照常使用 `rex-omp update`。
+从不含路径接收器的旧版升级，或升级器报 `could not fetch ... from promisor remote` 时，需要从修正后的规范源码引导一次：执行 `git pull --ff-only`，再运行 `python3 scripts/rex.py update`。之后照常使用 `rex-omp update`。失败候选不会替换当前可用版本，不要删除当前运行目录来修复升级。
 
 更新在候选 checkout 中合并 fork 的 `rex` 分支与官方 stable release，冻结安装依赖并检查 native binding、任务归属、只读行为及 CLI 后才切换。冲突或验证失败会明确报错，当前可用版本保持不变；fork 并不保证未来所有上游变更都无需人工处理。
 

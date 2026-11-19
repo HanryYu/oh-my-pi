@@ -184,7 +184,7 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(rex.json_read(runtime / "source/packages/coding-agent/package.json")["version"], "1.0.1")
         self.assertFalse((self.fork / "upstream-only.txt").exists())
 
-    def test_partial_clone_skips_deleted_blobs_without_losing_release_ancestry(self):
+    def test_partial_clone_merges_official_blobs_missing_from_fork_without_fetching_deleted_history(self):
         historical = self.fork / "historical.bin"
         historical.write_bytes(b"retired release asset\n" * 50000)
         self.commit(self.fork, "historical asset")
@@ -192,7 +192,18 @@ class UpdateTests(unittest.TestCase):
         historical.unlink()
         self.commit(self.fork, "remove historical asset")
         rex.git(self.fork, "config", "uploadpack.allowFilter", "true")
+        rex.git(self.upstream, "config", "uploadpack.allowFilter", "true")
+        (self.upstream / "shared.txt").write_text("official shared content\n")
         self.bump_upstream()
+        official_blob = rex.git(self.upstream, "rev-parse", "HEAD:upstream-only.txt")
+        # The fork knows the release commits but cannot serve its omitted blobs.
+        # Keep the local branch when removing the fixture's promisor remote.
+        rex.git(self.fork, "remote", "add", "official-fixture", self.upstream.as_uri())
+        rex.git(self.fork, "fetch", "--no-tags", "--filter=blob:none", "official-fixture",
+                "refs/tags/v1.0.1:refs/heads/official-fixture")
+        rex.git(self.fork, "remote", "remove", "official-fixture")
+        fork_objects = rex.git(self.fork, "rev-list", "--objects", "--missing=print", "--all")
+        self.assertIn("?" + official_blob, fork_objects.splitlines())
         home = self.base / "git-home"
         home.mkdir()
         origin = "https://rex-test.invalid/fork.git"
@@ -201,13 +212,21 @@ class UpdateTests(unittest.TestCase):
             rex.git(None, "config", "--global", "url." + self.fork.as_uri() + ".insteadOf", origin)
             runtime, fork_commit = rex.checkout_candidate(self.prefix, origin, branch="rex")
             source = runtime / "source"
-            objects = rex.git(source, "rev-list", "--objects", "--missing=print", "HEAD")
+            objects = rex.git(source, "rev-list", "--objects", "--missing=print", "--all")
             self.assertIn("?" + blob, objects.splitlines())
+            self.assertIn("?" + official_blob, objects.splitlines())
             self.assertTrue(rex.ancestor(source, self.base_commit, fork_commit))
             proof = rex.integrate_upstream(source, str(self.upstream), "v1.0.1", self.base_commit)
             self.assertTrue(rex.ancestor(source, proof["commit"], "HEAD"))
             self.assertTrue(rex.ancestor(source, fork_commit, "HEAD"))
             self.assertEqual(rex.json_read(source / "packages/coding-agent/package.json")["version"], "1.0.1")
+            self.assertEqual((source / "upstream-only.txt").read_text(), "official release\n")
+            self.assertEqual((source / "shared.txt").read_text(), "official shared content\n")
+            objects = rex.git(source, "rev-list", "--objects", "--missing=print", "--all")
+            self.assertIn("?" + blob, objects.splitlines())
+            # Fork-only history must still be retrievable from origin.
+            self.assertEqual(int(rex.git(source, "cat-file", "-s", blob)),
+                             len(b"retired release asset\n" * 50000))
 
     def test_activation_and_rollback_keep_previous_runtime_and_open_files_intact(self):
         old = self.install_old()

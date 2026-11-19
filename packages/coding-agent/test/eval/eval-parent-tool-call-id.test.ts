@@ -80,6 +80,26 @@ describe("eval parent tool causality", () => {
     for (const id of ids) expect(id).toMatch(/^outer-eval:[0-9a-f-]{36}$/);
   });
 
+  it("passes raw FREEFORM input without losing the originating eval call", async () => {
+    const calls: { id: string; input: string }[] = [];
+    const edit = {
+      name: "edit", label: "edit", description: "record raw input",
+      parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+      customFormat: { syntax: "lark", definition: "start: /[\\s\\S]+/" },
+      async execute(id: string, args: { input: string }) {
+        calls.push({ id, input: args.input });
+        return { content: [{ type: "text", text: "applied" }] };
+      },
+    } as unknown as AgentTool;
+    const session: ToolSession = {
+      ...sessionFor([]),
+      getToolByName: name => name === "edit" ? edit : undefined,
+    };
+    const input = "*** Begin Patch\n*** End Patch\n";
+    await callSessionTool("edit", input, { session, parentToolCallId: "outer-freeform" });
+    expect(calls).toEqual([{ id: expect.stringMatching(/^outer-freeform:[0-9a-f-]{36}$/), input }]);
+  });
+
   it("retains the original EvalTool owner after backgrounding and a newer eval", async () => {
     const ids: string[] = [];
     const manager = new AsyncJobManager({});

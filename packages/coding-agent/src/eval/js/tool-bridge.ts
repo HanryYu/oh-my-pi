@@ -296,6 +296,8 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		// messages; a bridged call would report success without taking effect.
 		throw new ToolError(`\`${name}\` cannot run through the eval bridge; call the direct \`${name}\` tool.`);
 	}
+	// FREEFORM tools (e.g. `edit`) take their raw text as `{ input }`, as providers deliver it.
+	if (typeof args === "string" && tool.customFormat) args = { input: args };
 	const toolCallId = options.parentToolCallId
 		? `${options.parentToolCallId}:${crypto.randomUUID()}`
 		: `js-${name}-${crypto.randomUUID()}`;

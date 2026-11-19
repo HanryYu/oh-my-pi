@@ -35,7 +35,7 @@ rex-omp update
 rex-omp rollback
 ```
 
-Upgrading an installation from before path-link support needs one bootstrap from the current checkout: run `git pull --ff-only`, then `python3 scripts/rex.py update`. Installation manifest v2 makes older managers reject incomplete candidates rather than activate new links without a receiver. Subsequent updates use `rex-omp update` normally.
+Installations from before path-link support, or whose updater fails with `could not fetch ... from promisor remote`, need one bootstrap from the corrected checkout: run `git pull --ff-only`, then `python3 scripts/rex.py update`. Subsequent updates use `rex-omp update` normally. Failed candidates leave the active runtime intact; do not delete it to recover an update.
 
 Updates merge the fork's `rex` branch with an official stable release in a candidate checkout. Frozen dependencies, matching native bindings, task-attribution/readonly regressions and CLI checks must pass before activation. Conflicts or failed checks leave the current runtime active and report an error. This is a maintained fork, not a guarantee that future upstream changes will merge without intervention.
 

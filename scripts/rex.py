@@ -201,7 +201,9 @@ def integrate_upstream(source, upstream, tag, initial_base=None):
     tag = "v" + version
     git(source, "remote", "add", "rex-upstream", remote(upstream))
     ref = "refs/tags/rex-upstream/" + tag
-    git(source, "fetch", "--no-tags", "rex-upstream", "refs/tags/" + tag + ":" + ref)
+    # A filtered fetch also registers upstream as a promisor, so official blobs
+    # can be fetched there while origin remains available for fork-only blobs.
+    git(source, "fetch", "--no-tags", "--filter=blob:none", "rex-upstream", "refs/tags/" + tag + ":" + ref)
     commit = git(source, "rev-parse", ref + "^{commit}")
     if initial_base and not ancestor(source, initial_base, commit):
         raise RexError("Official tag is not descended from this fork's supported base")
