@@ -1,4 +1,6 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MessageChannel, type MessagePort, receiveMessageOnPort } from "node:worker_threads";
 import { isRecord, logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
@@ -7,6 +9,7 @@ import {
 	resolveWorkerSpawnCmd,
 	workerEnvFromParent,
 } from "../../subprocess/worker-client";
+import { registerOnBoard } from "../../daemon/client";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -16,6 +19,7 @@ import { getEnabledEvalPreludes } from "../preludes";
 import {
 	abortReasonError,
 	attachSessionOwner,
+	type DisposeByOwnerOptions,
 	EvalKernelNotRunningError,
 	formatKernelRestartNotice,
 	type SessionOwners,
@@ -69,7 +73,8 @@ export interface JsEvalWorkerHandle {
 
 /** Startup dependencies overridden by tests to exercise process-to-Worker recovery. */
 export interface JsEvalWorkerFactories {
-	spawnProcess(): JsEvalWorkerHandle;
+	/** `sessionId` is the agent session the subprocess is listed under on the daemon board. */
+	spawnProcess(sessionId?: string): JsEvalWorkerHandle;
 	spawnWorker(): JsEvalWorkerHandle;
 }
 
@@ -124,6 +129,7 @@ interface JsSession {
 }
 
 interface StartingJsSession extends SessionOwners {
+	sessionId: string;
 	promise: Promise<JsSession>;
 }
 
@@ -402,6 +408,11 @@ export async function runIfSnapshotMatches(options: {
 	}
 }
 
+/** Whether `sessionKey` has a retained, live JS worker. */
+export function hasLiveVmContext(sessionKey: string): boolean {
+	return sessions.get(sessionKey)?.state === "alive";
+}
+
 export async function resetVmContext(sessionKey: string): Promise<void> {
 	lostSessions.delete(sessionKey);
 	const session = sessions.get(sessionKey) ?? (await startingSessions.get(sessionKey)?.promise.catch(() => undefined));
@@ -428,11 +439,13 @@ export async function disposeAllVmContexts(): Promise<void> {
 /**
  * Shut down retained JS contexts owned solely by `ownerId`; contexts with other
  * owners (e.g. an in-memory session keyed only by cwd) just drop the registration.
+ * Contexts for `options.keepSessionId` are left untouched.
  */
-export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
+export async function disposeVmContextsByOwner(ownerId: string, options?: DisposeByOwnerOptions): Promise<void> {
+	const keepSessionId = options?.keepSessionId;
 	const toKill: JsSession[] = [];
 	for (const session of Array.from(sessions.values())) {
-		if (!session.ownerIds.has(ownerId)) continue;
+		if (!session.ownerIds.has(ownerId) || session.sessionId === keepSessionId) continue;
 		if (session.ownerIds.size === 1) {
 			toKill.push(session);
 			continue;
@@ -441,7 +454,7 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 	}
 	const startingToKill: StartingJsSession[] = [];
 	for (const [sessionKey, starting] of Array.from(startingSessions.entries())) {
-		if (sessions.has(sessionKey) || !starting.ownerIds.has(ownerId)) continue;
+		if (sessions.has(sessionKey) || !starting.ownerIds.has(ownerId) || starting.sessionId === keepSessionId) continue;
 		if (starting.ownerIds.size === 1) {
 			startingSessions.delete(sessionKey);
 			startingToKill.push(starting);
@@ -453,7 +466,10 @@ export async function disposeVmContextsByOwner(ownerId: string): Promise<void> {
 		if (ownerIds.delete(ownerId) && ownerIds.size === 0) lostSessions.delete(sessionKey);
 	}
 	for (const session of toKill) {
-		if (sessions.get(session.sessionKey) === session) sessions.delete(session.sessionKey);
+		if (sessions.get(session.sessionKey) !== session) continue;
+		sessions.delete(session.sessionKey);
+		// The owner may return to this session id (switch back): its next cell must hear the VM state is gone.
+		lostSessions.set(session.sessionKey, new Set(session.ownerIds));
 	}
 	const started = await Promise.allSettled(startingToKill.map(starting => starting.promise));
 	for (const result of started) {
@@ -646,7 +662,7 @@ async function acquireSession(
 	const startup = (async (): Promise<JsSession> => {
 		// Attach the message listener before sending init. Both Bun Worker messages
 		// and subprocess IPC can arrive immediately after the evaluator loads.
-		const worker = spawnJsWorker();
+		const worker = spawnJsWorker(toolSession.getSessionId?.() ?? undefined);
 		const session: JsSession = {
 			sessionKey,
 			sessionId: snapshot.sessionId,
@@ -704,6 +720,7 @@ async function acquireSession(
 	startingSession = {
 		ownerIds: new Set(),
 		hasFallbackOwner: false,
+		sessionId: snapshot.sessionId,
 		promise: startup,
 	};
 	attachSessionOwner(startingSession, snapshot.sessionId, ownerId);
@@ -1003,9 +1020,9 @@ async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, reason
 	}
 }
 
-function spawnJsWorker(): JsEvalWorkerHandle {
+function spawnJsWorker(sessionId?: string): JsEvalWorkerHandle {
 	try {
-		return workerFactories.spawnProcess();
+		return workerFactories.spawnProcess(sessionId);
 	} catch (error) {
 		// A worker thread remains isolated and can interrupt synchronous user code
 		// via terminate(), so it is the only safe recovery from subprocess spawn.
@@ -1016,12 +1033,23 @@ function spawnJsWorker(): JsEvalWorkerHandle {
 	return workerFactories.spawnWorker();
 }
 
+const SOURCE_WORKER_ENTRY = new URL("./worker-entry.ts", import.meta.url);
+
+/**
+ * Without a declared host (the CLI was not the process entry, e.g. an npm/nvm shim), source
+ * checkouts start `worker-entry.ts` directly. A bundled `dist/cli.js` has no such sibling, but this
+ * module is the CLI bundle itself, which dispatches the worker argv like the declared host.
+ */
+function bundledHostEntry(): string | null {
+	return fs.existsSync(fileURLToPath(SOURCE_WORKER_ENTRY)) ? null : fileURLToPath(import.meta.url);
+}
+
 function spawnBunWorker(): JsEvalWorkerHandle {
 	try {
-		const hostEntry = workerHostEntry();
+		const hostEntry = workerHostEntry() ?? bundledHostEntry();
 		const worker = hostEntry
 			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_js_eval"] })
-			: new Worker(new URL("./worker-entry.ts", import.meta.url).href, { type: "module" });
+			: new Worker(SOURCE_WORKER_ENTRY.href, { type: "module" });
 		const channel = new MessageChannel();
 		const outbox: WorkerOutboxMessage = { type: "outbox", port: channel.port2 };
 		worker.postMessage(outbox, [channel.port2]);
@@ -1034,15 +1062,25 @@ function spawnBunWorker(): JsEvalWorkerHandle {
 	}
 }
 
-function spawnJsProcess(): JsEvalWorkerHandle {
+function spawnJsProcess(sessionId?: string): JsEvalWorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
-		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
+		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG, { sameBuild: true }),
 		env: workerEnvFromParent(),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,
 		unref: false,
 	});
+	const pid = spawned.proc.pid;
+	const board = registerOnBoard({
+		kind: "external",
+		scope: { kind: "session", id: sessionId || `process-${process.pid}` },
+		key: `js-eval:${pid}`,
+		label: "js eval",
+		pid,
+	});
+	// Exit covers every teardown path: close, terminate, and crashes.
+	void spawned.proc.exited.finally(() => board.dispose());
 	const base = createWorkerHandle<WorkerInbound, WorkerOutbound>(spawned, message =>
 		safeSendIpc(spawned.proc, message, "js-eval"),
 	);

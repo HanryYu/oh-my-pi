@@ -1,5 +1,5 @@
 import type { Component } from "../tui";
-import { getProjectDir, jsonContainerEnd, sanitizeText } from "@oh-my-pi/pi-utils";
+import { getProjectDir, jsonContainerEnd, sanitizeText, spillUrl } from "@oh-my-pi/pi-utils";
 import { highlightCode, type Theme } from "../theme/theme";
 import { renderStatusLine } from "../render/status-line";
 import { framedToolCard, type ToolCardSnapshot } from "../render/tool-card";
@@ -84,7 +84,7 @@ export interface BashToolDetails {
 	/** Text the command wrote to `out://`, oldest first; transcripts draw each as a reply after the call. */
 	replies?: string[];
 	/**
-	 * The embedded shell's live trace of the command (pi-shell `RunTrace`): every frame carries the
+	 * The embedded shell's live trace of the command (omp-shell `RunTrace`): every frame carries the
 	 * latest snapshot and the final result the last one. Absent on the PTY and user-shell paths.
 	 */
 	trace?: ShellTrace;
@@ -387,7 +387,7 @@ function bashStatsParts(
 		);
 	}
 	if (artifactId) {
-		statsParts.push(`Artifact: ${artifactId}`);
+		statsParts.push(`Full output: ${spillUrl(artifactId)}`);
 	}
 	const minimized = details?.meta?.minimized;
 	if (minimized) {
@@ -621,9 +621,13 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					const expanded = renderContext?.expanded ?? options.expanded;
 					const previewLines = renderContext?.previewLines ?? BASH_DEFAULT_PREVIEW_LINES;
 					// A traced command redraws on every folded event; its running
-					// glyphs spin with the frame (only while the run is live).
+					// glyphs spin with the frame (only while the run is live). A result
+					// without a trace yet (a call that returned as a background job before
+					// the first trace poll) keeps the call's untraced presentation.
 					const trace = options.shellTrace ?? details?.trace;
-					const presentation = trace === undefined ? undefined : options.shellPresentation;
+					const presentation = options.shellPresentation;
+					// Without a trace the presentation parsed the raw command, `cd` and all.
+					const scriptDetails = trace === undefined ? undefined : details;
 
 					// Get output from context (preferred) or fall back to result content.
 					// Strip the LLM-facing notice appended by wrappedExecute so we don't
@@ -720,7 +724,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								// render identically; only ctrl+o uncaps.
 								content: capPreviewLines(
 									presentation
-										? visualCommandLines(presentation, renderArgs, details, uiTheme, contentWidth)
+										? visualCommandLines(presentation, renderArgs, scriptDetails, uiTheme, contentWidth)
 										: args
 											? (cmdLines ??= formatBashCommandLines(renderArgs, uiTheme))
 											: [],
@@ -814,15 +818,21 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 					? undefined
 					: (details?.wallTimeMs ?? options.elapsedMs);
 			const meta = details?.meta;
-			// Native hosts render the same engine-produced presentation as the ANSI inspector.
+			// Native hosts render the same engine-produced presentation as the ANSI inspector,
+			// including the untraced one of a result that landed before the first trace poll.
 			const trace = options.shell === true ? (options.shellTrace ?? details?.trace) : undefined;
-			const presentation = options.shell === true && trace ? options.shellPresentation : undefined;
+			const presentation = options.shell === true ? options.shellPresentation : undefined;
 			// The shell node is the command pane only; the run's ordinary output
 			// segment draws what ran: the live result, or the output retained up
-			// to the replay cursor while one is held.
-			const shownOutput = presentation?.preferences.cursor !== undefined ? presentation.output.trimEnd() : output;
+			// to the replay cursor while one is held. An untraced run has nothing to
+			// replay, so a cursor set on it never hides the result.
+			const shownOutput =
+				trace !== undefined && presentation?.preferences.cursor !== undefined
+					? presentation.output.trimEnd()
+					: output;
+			// Without a trace the presentation parsed the raw command, `cd` and all.
 			const displayWorkdir = formatToolWorkingDirectory(
-				executedScriptArgs(renderArgs, details).cwd,
+				executedScriptArgs(renderArgs, trace === undefined ? undefined : details).cwd,
 				getProjectDir(),
 			);
 			const box = runBox(
